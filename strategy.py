@@ -65,10 +65,18 @@ def evaluate_1h_signal(
     atr   = i1.get("atr")
     close = i1.get("close")
 
-    ema_t_prev = i1.get("ema_trend_prev")   # EMA200 N bars ago for slope filter
-    vol_ratio  = i1.get("vol_ratio")        # current volume / 20-bar MA
+    ema_t_prev  = i1.get("ema_trend_prev")   # EMA200 N bars ago for slope filter
+    vol_ratio   = i1.get("vol_ratio")        # current volume / 20-bar MA
+    rolling_max = i1.get("rolling_max")      # rolling N-bar high (breakout threshold)
+    rolling_min = i1.get("rolling_min")      # rolling N-bar low  (breakout threshold)
 
-    if any(v is None for v in [ema_f, ema_s, ema_t, rsi, hist, h_prv, atr, close]):
+    atr_ratio    = i1.get("atr_ratio")
+    adx_val      = i1.get("adx")
+
+    macd_long_ok  = hist is not None and h_prv is not None and hist > 0 and hist > h_prv
+    macd_short_ok = hist is not None and h_prv is not None and hist < 0 and hist < h_prv
+
+    if any(v is None for v in [ema_f, ema_s, ema_t, rsi, atr, close]):
         return None
     if close == 0:
         return None
@@ -87,25 +95,49 @@ def evaluate_1h_signal(
     if vol_ratio is not None and vol_ratio < config.VOL_RATIO_MIN:
         return None
 
+    # ATR ratio filter: skip contracting-ATR (choppy) regimes
+    if config.ATR_RATIO_MIN > 0 and atr_ratio is not None and atr_ratio < config.ATR_RATIO_MIN:
+        return None
+
+    # ADX filter: skip low-trend-strength (choppy/ranging) markets
+    if config.ADX_MIN > 0 and adx_val is not None and adx_val < config.ADX_MIN:
+        return None
+
     # EMA200 slope: only trade when macro trend is moving in trade direction
-    trend_rising  = ema_t_prev is None or ema_t >= ema_t_prev
-    trend_falling = ema_t_prev is None or ema_t <= ema_t_prev
+    # With EMA_SLOPE_MIN_PCT > 0: require EMA200 to have moved a minimum percentage
+    # (eliminates flat-EMA false breakouts in sideways markets)
+    if config.EMA_SLOPE_MIN_PCT > 0 and ema_t_prev is not None:
+        slope_needed = ema_t * (config.EMA_SLOPE_MIN_PCT / 100)
+        trend_rising  = (ema_t - ema_t_prev) >= slope_needed
+        trend_falling = (ema_t_prev - ema_t) >= slope_needed
+    else:
+        trend_rising  = ema_t_prev is None or ema_t >= ema_t_prev
+        trend_falling = ema_t_prev is None or ema_t <= ema_t_prev
+
+    bo_buf = atr * config.BREAKOUT_ATR_BUFFER
+
+    # EMA200 distance: how far price is from EMA200 (positive = above)
+    ema_dist_pct = (close - ema_t) / ema_t * 100
+    ema_dist_ok_long  = ema_dist_pct >= config.EMA_TREND_DISTANCE_MIN
+    ema_dist_ok_short = (-ema_dist_pct) >= config.EMA_TREND_DISTANCE_MIN
 
     long_ok = (
         ema_f > ema_s                              # EMA20 above EMA50
-        and close > ema_t                          # price above EMA200 (macro bull)
+        and ema_dist_ok_long                       # price ≥ EMA200 by EMA_TREND_DISTANCE_MIN%
         and trend_rising                           # EMA200 still rising (macro momentum)
         and config.RSI_1H_LONG_MIN <= rsi <= config.RSI_1H_LONG_MAX   # bullish but not overbought
-        and hist > 0                               # MACD in positive territory
-        and hist > h_prv                           # momentum accelerating upward
+        and rolling_max is not None
+        and close > rolling_max + bo_buf           # price breaks above N-bar high (momentum breakout)
+        and (not config.REQUIRE_MACD_CONFIRM or macd_long_ok)
     )
     short_ok = (
         ema_f < ema_s
-        and close < ema_t                          # price below EMA200 (macro bear)
+        and ema_dist_ok_short                      # price ≤ EMA200 by EMA_TREND_DISTANCE_MIN%
         and trend_falling                          # EMA200 still falling (macro momentum)
         and config.RSI_1H_SHORT_MIN <= rsi <= config.RSI_1H_SHORT_MAX   # bearish but not oversold
-        and hist < 0
-        and hist < h_prv                           # momentum accelerating downward
+        and rolling_min is not None
+        and close < rolling_min - bo_buf           # price breaks below N-bar low
+        and (not config.REQUIRE_MACD_CONFIRM or macd_short_ok)
     )
 
     if not long_ok and not short_ok:
@@ -125,7 +157,7 @@ def evaluate_1h_signal(
     reason = (
         f"{side} | ema200={'above' if close > ema_t else 'below'} "
         f"ema_sep={sep*100:.2f}% rsi={rsi:.1f} "
-        f"hist={hist:.2f}(Δ{hist-h_prv:+.2f}) "
+        f"bo_lvl={rolling_max if side=='LONG' else rolling_min:.2f} "
         f"atr%={atr_pct:.2f} rr={rr}"
     )
     return Signal(
@@ -207,11 +239,50 @@ def evaluate(state: MarketState, bars_since_last_trade: int = 9999) -> Optional[
 
 def position_size_usdt(balance, entry, sl,
                        risk_pct=None, leverage=None) -> float:
-    if risk_pct is None:
-        risk_pct = config.RISK_PERCENT
-    if leverage is None:
-        leverage = config.LEVERAGE
+    if config.RISK_USD > 0:
+        risk = config.RISK_USD
+    else:
+        risk_pct = risk_pct if risk_pct is not None else config.RISK_PERCENT
+        risk = balance * (risk_pct / 100)
     sl_dist_pct = abs(entry - sl) / entry
     if sl_dist_pct == 0:
         return 0.0
-    return balance * (risk_pct / 100) / (entry * sl_dist_pct)
+    qty = risk / (entry * sl_dist_pct)
+    lev = leverage if leverage is not None else config.LEVERAGE
+    if lev > 0:
+        qty = min(qty, balance * lev / entry)
+    return qty
+
+
+def evaluate_1h_live(state, bars_since_last: int = 9999) -> Optional[Signal]:
+    """Evaluate 1H breakout signal for live trading — mirrors the proven backtest strategy."""
+    if state.buf_1h.count < config.MIN_CANDLES_1H:
+        return None
+
+    o1, h1, l1, c1, v1 = state.buf_1h.arrays()
+    i1 = ind.compute_all(o1, h1, l1, c1, config, volumes=v1)
+
+    # EMA200 (macro trend filter)
+    ema200_arr = ind.ema(c1, config.EMA_TREND)
+    valid_ema200 = ema200_arr[~np.isnan(ema200_arr)]
+    i1["ema_trend"] = float(valid_ema200[-1]) if len(valid_ema200) else None
+
+    # EMA200 slope N bars ago
+    slope_bars = config.EMA_TREND_SLOPE_BARS
+    i1["ema_trend_prev"] = float(valid_ema200[-slope_bars - 1]) \
+        if len(valid_ema200) > slope_bars else None
+
+    # Rolling high/low for breakout (exclude current bar — consistent with backtest)
+    bp = config.BREAKOUT_PERIOD
+    if len(c1) > bp:
+        i1["rolling_max"] = float(h1[-bp - 1:-1].max())
+        i1["rolling_min"] = float(l1[-bp - 1:-1].min())
+    else:
+        i1["rolling_max"] = None
+        i1["rolling_min"] = None
+
+    # ADX — trend strength filter (critical for bear markets; not in compute_all)
+    adx_arr = ind.adx(h1, l1, c1, config.ADX_PERIOD)
+    i1["adx"] = ind.last(adx_arr)
+
+    return evaluate_1h_signal(i1, bars_since_last)

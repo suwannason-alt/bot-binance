@@ -106,6 +106,69 @@ def bollinger_bands(
     return upper, middle, lower
 
 
+def adx(
+    highs: np.ndarray,
+    lows: np.ndarray,
+    closes: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """Average Directional Index — measures trend *strength* (not direction).
+    ADX > 25 = strong trend (breakouts reliable)
+    ADX < 20 = ranging/choppy (breakouts fail)
+    """
+    n = len(closes)
+    result = np.full(n, np.nan, dtype=float)
+    if n < period * 2 + 1:
+        return result
+
+    h_prev = highs[:-1]; h_curr = highs[1:]
+    l_prev = lows[:-1];  l_curr = lows[1:]
+
+    h_diff = h_curr - h_prev
+    l_diff = l_prev - l_curr
+
+    plus_dm  = np.where((h_diff > l_diff) & (h_diff > 0), h_diff, 0.0)
+    minus_dm = np.where((l_diff > h_diff) & (l_diff > 0), l_diff, 0.0)
+
+    tr = np.maximum(
+        h_curr - l_curr,
+        np.maximum(np.abs(h_curr - closes[:-1]), np.abs(l_curr - closes[:-1])),
+    )
+
+    # Wilder's smoothing: sum for first period, then rolling subtract-add
+    atr_w = np.full(n, np.nan, dtype=float)
+    pdm_w = np.full(n, np.nan, dtype=float)
+    mdm_w = np.full(n, np.nan, dtype=float)
+
+    atr_w[period]  = tr[:period].sum()
+    pdm_w[period]  = plus_dm[:period].sum()
+    mdm_w[period]  = minus_dm[:period].sum()
+
+    for i in range(period + 1, n):
+        atr_w[i] = atr_w[i-1] - atr_w[i-1] / period + tr[i-1]
+        pdm_w[i] = pdm_w[i-1] - pdm_w[i-1] / period + plus_dm[i-1]
+        mdm_w[i] = mdm_w[i-1] - mdm_w[i-1] / period + minus_dm[i-1]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        plus_di  = np.where(atr_w > 0, 100.0 * pdm_w / atr_w, np.nan)
+        minus_di = np.where(atr_w > 0, 100.0 * mdm_w / atr_w, np.nan)
+        di_sum   = plus_di + minus_di
+        dx       = np.where(di_sum > 0,
+                            100.0 * np.abs(plus_di - minus_di) / di_sum,
+                            np.nan)
+
+    # First ADX = mean of first `period` DX values (starting at index `period`)
+    start = 2 * period - 1
+    dx_window = dx[period:start]
+    if not np.any(np.isnan(dx_window)) and len(dx_window) == period - 1:
+        result[start] = np.nanmean(dx[period : start + 1])
+        for i in range(start + 1, n):
+            if not np.isnan(result[i-1]) and not np.isnan(dx[i]):
+                result[i] = (result[i-1] * (period - 1) + dx[i]) / period
+
+    return result
+
+
 def last(arr: np.ndarray) -> Optional[float]:
     valid = arr[~np.isnan(arr)]
     return float(valid[-1]) if len(valid) > 0 else None
@@ -151,6 +214,15 @@ def compute_all(
     valid_hist = histogram[~np.isnan(histogram)]
     hist_prev = float(valid_hist[-2]) if len(valid_hist) >= 2 else None
 
+    # ATR ratio: current ATR vs its 20-bar SMA (regime strength filter)
+    # > 1.0 = ATR expanding (trending market)  < 1.0 = ATR contracting (choppy market)
+    atr_ratio = None
+    atr_sma_arr = sma(atr_arr, 20)
+    last_atr = last(atr_arr)
+    last_atr_sma = last(atr_sma_arr)
+    if last_atr is not None and last_atr_sma is not None and last_atr_sma > 0:
+        atr_ratio = last_atr / last_atr_sma
+
     return {
         "ema_fast":       last(ema_fast_arr),
         "ema_slow":       last(ema_slow_arr),
@@ -161,6 +233,7 @@ def compute_all(
         "macd_hist":      last(histogram),
         "macd_hist_prev": hist_prev,
         "atr":            last(atr_arr),
+        "atr_ratio":      atr_ratio,
         "bb_upper":       bbu,
         "bb_mid":         bbm,
         "bb_lower":       bbl,

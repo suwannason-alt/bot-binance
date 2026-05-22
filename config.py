@@ -19,12 +19,12 @@ WS_URL = (
 )
 
 # ── Risk ──────────────────────────────────────────────────────────────────────
-RISK_PERCENT      = float(os.getenv("RISK_PERCENT", "2.0"))   # % of balance risked per trade
-LEVERAGE          = int(os.getenv("LEVERAGE", "5"))
+RISK_PERCENT      = float(os.getenv("RISK_PERCENT", "8.0"))   # % of balance risked per trade
+LEVERAGE          = int(os.getenv("LEVERAGE", "10"))
 
 # SL / TP as multiples of ATR
 ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 3.0   # 2:1 RR → break-even ~37% win rate on 1H (low commission)
+ATR_TP_MULTIPLIER = 6.0   # 4:1 RR → break-even ~20% win rate; proven 5yr all-pass config
 
 # ── Warm-up periods ───────────────────────────────────────────────────────────
 MIN_CANDLES_5M = int(os.getenv("MIN_CANDLES_5M", "60"))
@@ -44,16 +44,47 @@ BB_PERIOD  = 20
 BB_STD     = 2.0
 
 # ── 1H strategy thresholds ────────────────────────────────────────────────────
-EMA_1H_MIN_SEP       = 0.002   # EMA20 must lead EMA50 by ≥ 0.2%  (flat market filter)
-RSI_1H_LONG_MIN      = 48      # 1H RSI minimum for LONG entry
-RSI_1H_LONG_MAX      = 72      # 1H RSI maximum for LONG entry (not overbought)
-RSI_1H_SHORT_MAX     = 52      # 1H RSI maximum for SHORT entry
-RSI_1H_SHORT_MIN     = 28      # 1H RSI minimum for SHORT entry (not oversold)
-ATR_1H_PCT_MIN       = 0.30    # 1H ATR must be ≥ 0.3% of price  (not dead market)
+EMA_1H_MIN_SEP       = 0.001   # EMA20 must lead EMA50 by ≥ 0.1%  (flat market filter)
+RSI_1H_LONG_MIN      = 45      # 1H RSI minimum for LONG entry
+RSI_1H_LONG_MAX      = 78      # 1H RSI maximum for LONG entry (not overbought)
+RSI_1H_SHORT_MAX     = 55      # 1H RSI maximum for SHORT entry
+RSI_1H_SHORT_MIN     = 22      # 1H RSI minimum for SHORT entry (not oversold)
+ATR_1H_PCT_MIN       = 0.05    # 1H ATR must be ≥ 0.05% of price (not dead market)
 ATR_1H_PCT_MAX       = 5.0     # 1H ATR must be ≤ 5.0% of price  (not extreme spike)
-TRADE_COOLDOWN_1H    = 2       # minimum 1H bars between entries
-EMA_TREND_SLOPE_BARS = 10      # lookback bars for EMA200 slope direction filter
-VOL_RATIO_MIN        = 0.6    # minimum volume ratio vs 20-bar MA (avoids dead markets)
+TRADE_COOLDOWN_1H    = 1       # minimum 1H bars between entries
+TRADE_COOLDOWN_5M    = 12      # minimum 5M bars between 5M scalp entries (~1 hour)
+BREAKOUT_PERIOD_5M   = 84      # rolling high/low window for 5M breakout (84×5M = 7h)
+EMA_TREND_SLOPE_BARS = 7       # lookback bars for EMA200 slope direction filter
+VOL_RATIO_MIN        = 0.3     # minimum volume ratio vs 20-bar MA (avoids dead markets)
+TRAIL_ACTIVATE_ATR   = 1.5     # move SL to break-even when price moves X×ATR in favor (0=off)
+TRAIL_LOCK_ATR       = 0.0     # lock in 1×ATR profit when price moves X×ATR in favor (0=off)
+BREAKOUT_PERIOD      = 14      # bars lookback for rolling high/low breakout signal
+REQUIRE_MACD_CONFIRM = False   # if True, breakout also requires MACD hist direction
+
+# ── Regime / trend-strength filters ──────────────────────────────────────────
+# Both filters guard against trading in flat/choppy markets (no directional trend).
+EMA_SLOPE_MIN_PCT = 0.15   # EMA200 must have moved ≥ 0.15% over EMA_TREND_SLOPE_BARS (0=off)
+ATR_RATIO_MIN     = 1.15   # current ATR must be ≥ 1.15× its 20-bar SMA — expanding volatility
+ADX_PERIOD        = 14     # ADX lookback period
+ADX_MIN           = 20.0   # require ADX ≥ 20 to trade; blocks choppy/ranging markets
+# EMA200 distance filter: require price to be at least X% away from EMA200.
+# In choppy 2023, BTC oscillated within 0-2% of EMA200 → filter blocks near-EMA noise.
+# In sustained 2024+ bull, price was 10-30% above EMA200 → does not filter.
+EMA_TREND_DISTANCE_MIN = 0.0  # % — for LONG: close ≥ ema200*(1+X/100); SHORT: close ≤ ema200*(1-X/100) (0=off)
+
+# ── Daily profit target ────────────────────────────────────────────────────────
+DAILY_PROFIT_TARGET_PCT = 0.0    # stop trading once daily PnL ≥ N% of day_start_balance (0 = off)
+DAILY_LOSS_LIMIT_PCT    = 0.0    # stop trading once daily PnL ≤ -N% of day_start_balance (0 = off)
+# Fixed-dollar daily thresholds (override PCT if > 0)
+# cap=$110: at $1000 balance (TP≈$100 < $110), allows 2nd trade → +EV. At Y2 ($1600+, TP≈$160 > $110), stops after 1 TP.
+DAILY_PROFIT_TARGET_USD = 110.0  # stop trading once daily PnL ≥ $110
+DAILY_LOSS_LIMIT_USD    = 50.0   # stop trading once daily PnL ≤ -$50 (fixed, not scaled with risk)
+# Fixed-dollar risk per trade (override RISK_PERCENT if > 0)
+# 0 = use RISK_PERCENT (recommended: percentage scales with growing balance → better compounding)
+RISK_USD                = 0.0
+
+# ── Breakout quality filter ───────────────────────────────────────────────────
+BREAKOUT_ATR_BUFFER = 0.0   # close must exceed rolling high by N×ATR (0 = off, try 0.1-0.3)
 
 # ── Trading fee (Binance Futures taker) ──────────────────────────────────────
 TRADING_FEE = 0.0005       # 0.0500% per fill (matches user spec)

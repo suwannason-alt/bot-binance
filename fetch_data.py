@@ -57,10 +57,35 @@ async def _fetch_batch(
         return await r.json()
 
 
+async def _fetch_range(session: aiohttp.ClientSession,
+                       symbol: str, interval: str,
+                       start_ms: int, end_ms: int,
+                       label: str = "") -> list:
+    """Fetch all bars in [start_ms, end_ms] across multiple batches."""
+    step_ms = INTERVAL_MS[interval]
+    rows: list = []
+    current = start_ms
+    total = max((end_ms - start_ms) // step_ms, 1)
+    fetched = 0
+    while current < end_ms:
+        batch = await _fetch_batch(session, symbol, interval, current, end_ms)
+        if not batch:
+            break
+        rows.extend(batch)
+        fetched += len(batch)
+        current = batch[-1][0] + step_ms
+        pct = min(fetched / total * 100, 100)
+        tag = f"[{interval}{' '+label if label else ''}]"
+        print(f"\r  {tag} {fetched:,}/{total:,} bars  ({pct:.0f}%)", end="", flush=True)
+        await asyncio.sleep(0.05)
+    print()
+    return rows
+
+
 async def fetch_klines(symbol: str, interval: str, days: int = 365) -> pd.DataFrame:
     """
     Fetch `days` of klines. Returns a DataFrame with numeric columns.
-    Uses cached CSV if available and fresh enough; otherwise fetches incrementally.
+    Uses cached CSV if available; extends backward and/or forward as needed.
     """
     step_ms = INTERVAL_MS[interval]
     now_ms = int(time.time() * 1000)
@@ -68,59 +93,57 @@ async def fetch_klines(symbol: str, interval: str, days: int = 365) -> pd.DataFr
     target_end = now_ms - step_ms  # exclude the currently-open candle
 
     cached = _cache_path(symbol, interval)
-    old_df = None
+    parts: list[pd.DataFrame] = []
 
     if os.path.exists(cached):
         old_df = pd.read_csv(cached, dtype={"open_time": int, "close_time": int})
-        cache_end = int(old_df["close_time"].iloc[-1])
-        gap = target_end - cache_end
-        if gap < step_ms * 3:
+        old_df = _cast_numeric(old_df)
+        cache_start = int(old_df["open_time"].iloc[0])
+        cache_end   = int(old_df["close_time"].iloc[-1])
+
+        needs_older = target_start < cache_start - step_ms
+        needs_newer = (target_end - cache_end) >= step_ms * 3
+
+        if not needs_older and not needs_newer:
             logger.info(f"Cache hit: {interval} ({len(old_df)} bars)")
-            old_df = _cast_numeric(old_df)
             return old_df[old_df["open_time"] >= target_start].reset_index(drop=True)
-        fetch_start = cache_end + 1
-        logger.info(
-            f"Updating {interval} from {datetime.fromtimestamp(fetch_start/1000):%Y-%m-%d %H:%M}"
-        )
+
+        async with aiohttp.ClientSession() as session:
+            if needs_older:
+                logger.info(
+                    f"Back-filling {interval} "
+                    f"{datetime.fromtimestamp(target_start/1000):%Y-%m-%d} → "
+                    f"{datetime.fromtimestamp(cache_start/1000):%Y-%m-%d}"
+                )
+                rows = await _fetch_range(session, symbol, interval,
+                                          target_start, cache_start, label="back-fill")
+                if rows:
+                    parts.append(_cast_numeric(pd.DataFrame(rows, columns=KLINE_COLS)))
+
+            parts.append(old_df)
+
+            if needs_newer:
+                logger.info(
+                    f"Updating {interval} from "
+                    f"{datetime.fromtimestamp(cache_end/1000):%Y-%m-%d %H:%M}"
+                )
+                rows = await _fetch_range(session, symbol, interval,
+                                          cache_end + 1, target_end, label="update")
+                if rows:
+                    parts.append(_cast_numeric(pd.DataFrame(rows, columns=KLINE_COLS)))
     else:
-        fetch_start = target_start
         total_bars = (target_end - target_start) // step_ms
-        logger.info(
-            f"Fetching {days}d of {interval} data for {symbol} (~{total_bars:,} bars)"
-        )
+        logger.info(f"Fetching {days}d of {interval} data for {symbol} (~{total_bars:,} bars)")
+        async with aiohttp.ClientSession() as session:
+            rows = await _fetch_range(session, symbol, interval, target_start, target_end)
+        parts.append(_cast_numeric(pd.DataFrame(rows, columns=KLINE_COLS)))
 
-    rows: list = []
-    current = fetch_start
-    total = max((target_end - fetch_start) // step_ms, 1)
-    fetched = 0
-
-    async with aiohttp.ClientSession() as session:
-        while current < target_end:
-            batch = await _fetch_batch(session, symbol, interval, current, target_end)
-            if not batch:
-                break
-            rows.extend(batch)
-            fetched += len(batch)
-            current = batch[-1][0] + step_ms
-            pct = min(fetched / total * 100, 100)
-            print(f"\r  [{interval}] {fetched:,}/{total:,} bars  ({pct:.0f}%)", end="", flush=True)
-            await asyncio.sleep(0.05)  # stay well within rate limits
-
-    print()
-
-    new_df = pd.DataFrame(rows, columns=KLINE_COLS)
-
-    if old_df is not None:
-        df = pd.concat([old_df, new_df], ignore_index=True)
-    else:
-        df = new_df
-
+    df = pd.concat(parts, ignore_index=True)
     df = (
         df.drop_duplicates("open_time")
         .sort_values("open_time")
         .reset_index(drop=True)
     )
-    # Trim to requested window
     df = df[df["open_time"] >= target_start].reset_index(drop=True)
     df = _cast_numeric(df)
     df.to_csv(cached, index=False)
