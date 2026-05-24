@@ -20,7 +20,12 @@ WS_URL = (
 
 # ── Risk ──────────────────────────────────────────────────────────────────────
 RISK_PERCENT      = float(os.getenv("RISK_PERCENT", "8.0"))   # % of balance risked per trade
-LEVERAGE          = int(os.getenv("LEVERAGE", "10"))
+LEVERAGE          = int(os.getenv("LEVERAGE", "10"))           # futures leverage multiplier
+
+# Fixed order-balance sizing (overrides RISK_PERCENT / RISK_USD when > 0)
+# Example: ORDER_BALANCE_USD=100, LEVERAGE=10 → each order has $1 000 notional exposure
+# qty = (ORDER_BALANCE_USD × LEVERAGE) / entry_price
+ORDER_BALANCE_USD = float(os.getenv("ORDER_BALANCE_USD", "0.0"))
 
 # SL / TP as multiples of ATR
 ATR_SL_MULTIPLIER = 1.5
@@ -58,6 +63,7 @@ EMA_TREND_SLOPE_BARS = 7       # lookback bars for EMA200 slope direction filter
 VOL_RATIO_MIN        = 0.3     # minimum volume ratio vs 20-bar MA (avoids dead markets)
 TRAIL_ACTIVATE_ATR   = 1.5     # move SL to break-even when price moves X×ATR in favor (0=off)
 TRAIL_LOCK_ATR       = 0.0     # lock in 1×ATR profit when price moves X×ATR in favor (0=off)
+TRAIL_STOP_ATR       = 0.0     # after TRAIL_ACTIVATE: trail SL at -N×ATR below price peak (0=off)
 BREAKOUT_PERIOD      = 14      # bars lookback for rolling high/low breakout signal
 REQUIRE_MACD_CONFIRM = False   # if True, breakout also requires MACD hist direction
 
@@ -83,9 +89,28 @@ DAILY_LOSS_LIMIT_USD    = 50.0   # stop trading once daily PnL ≤ -$50 (fixed, 
 # 0 = use RISK_PERCENT (recommended: percentage scales with growing balance → better compounding)
 RISK_USD                = 0.0
 
+# ── Position-sizing priority (highest → lowest) ───────────────────────────────
+# 1. ORDER_BALANCE_USD > 0  →  qty = (ORDER_BALANCE_USD × LEVERAGE) / entry
+# 2. RISK_USD > 0           →  qty = RISK_USD / (entry × sl_dist),  cap @ LEVERAGE × balance / entry
+# 3. RISK_PERCENT           →  qty = (balance × RISK%) / (entry × sl_dist),  cap @ LEVERAGE × balance / entry
+
 # ── Breakout quality filter ───────────────────────────────────────────────────
 BREAKOUT_ATR_BUFFER = 0.0   # close must exceed rolling high by N×ATR (0 = off, try 0.1-0.3)
 
 # ── Trading fee (Binance Futures taker) ──────────────────────────────────────
 TRADING_FEE = 0.0005       # 0.0500% per fill (matches user spec)
 SLIPPAGE    = 0.0002       # 0.02% market impact per fill
+
+# ── Live trading safety ───────────────────────────────────────────────────────
+# Funding rate guard: skip new entries when |funding_rate| exceeds this threshold.
+# Binance pays/charges funding every 8 h. At 0.10 %/8 h you pay ~11 % APR just for holding.
+FUNDING_RATE_MAX   = float(os.getenv("FUNDING_RATE_MAX", "0.001"))  # 0.10 %/8h (0 = off)
+
+# BTC/USDT Futures minimum order size and precision (Binance exchange rules).
+# Orders below MIN_ORDER_QTY or with wrong precision are rejected outright.
+MIN_ORDER_QTY      = float(os.getenv("MIN_ORDER_QTY", "0.001"))     # BTC min lot size
+QTY_STEP           = float(os.getenv("QTY_STEP",      "0.001"))     # BTC quantity step
+PRICE_TICK         = float(os.getenv("PRICE_TICK",    "0.10"))      # BTC price tick size (0.1 USDT)
+
+# Heartbeat: log a status line every N seconds even with no trade activity.
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))    # 15 min

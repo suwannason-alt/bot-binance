@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Bash(python3 *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(tee /tmp/backtest_6yr_v2.txt)",
+      "Bash(echo \"Exit: $?\")",
+      "Bash(tee /tmp/backtest_7yr.txt)"
     ]
   }
 }

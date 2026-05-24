@@ -62,7 +62,19 @@ def _commission_cost(price: float, qty: float) -> float:
 
 
 def _position_qty(balance: float, entry: float, sl: float) -> float:
-    # Use fixed-dollar risk if configured, otherwise % of balance
+    """Return the contract quantity for this trade.
+
+    Priority (highest → lowest):
+      1. ORDER_BALANCE_USD > 0  →  fixed margin × leverage (ignores SL distance)
+      2. RISK_USD > 0           →  fixed-dollar risk, capped by margin limit
+      3. RISK_PERCENT           →  % of balance risk, capped by margin limit
+    """
+    # 1. Fixed order-balance sizing: qty = (margin × leverage) / entry
+    if config.ORDER_BALANCE_USD > 0:
+        notional = config.ORDER_BALANCE_USD * max(config.LEVERAGE, 1)
+        return notional / entry
+
+    # 2/3. Risk-based sizing
     risk    = config.RISK_USD if config.RISK_USD > 0 else balance * (config.RISK_PERCENT / 100)
     sl_dist = abs(entry - sl) / entry
     if sl_dist == 0:
@@ -197,11 +209,25 @@ def run(
                     if new_sl > position["sl"]:
                         position["sl"] = new_sl
                     position["be_activated"] = True
+                    position["trail_peak"]   = h5[i]
                 elif position["side"] == "SHORT" and l5[i] <= e_p - trigger:
                     new_sl = e_p
                     if new_sl < position["sl"]:
                         position["sl"] = new_sl
                     position["be_activated"] = True
+                    position["trail_peak"]   = l5[i]
+
+            if config.TRAIL_STOP_ATR > 0 and position["be_activated"]:
+                if position["side"] == "LONG":
+                    position["trail_peak"] = max(position["trail_peak"], h5[i])
+                    trail_sl = position["trail_peak"] - config.TRAIL_STOP_ATR * e_atr
+                    if trail_sl > position["sl"]:
+                        position["sl"] = trail_sl
+                else:
+                    position["trail_peak"] = min(position["trail_peak"], l5[i])
+                    trail_sl = position["trail_peak"] + config.TRAIL_STOP_ATR * e_atr
+                    if trail_sl < position["sl"]:
+                        position["sl"] = trail_sl
 
             if config.TRAIL_LOCK_ATR > 0 and not position["lock_activated"]:
                 trigger2 = e_atr * config.TRAIL_LOCK_ATR
@@ -486,6 +512,7 @@ def run(
             "entry_atr":     float(atr_1h[j]),
             "be_activated":  False,
             "lock_activated": False,
+            "trail_peak":    None,
         }
         last_trade_1h_bar = j
 

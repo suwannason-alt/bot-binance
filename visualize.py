@@ -79,7 +79,7 @@ def plot(result: BacktestResult, show: bool = False,
     # Row 1: price chart (tall)
     # Row 2: equity curve (tall)
     # Row 3: drawdown | daily P&L (medium)
-    fig = plt.figure(figsize=(22, 20), facecolor=BG)
+    fig = plt.figure(figsize=(22, 18), facecolor=BG)
     gs = gridspec.GridSpec(
         4, 2,
         figure=fig,
@@ -87,7 +87,7 @@ def plot(result: BacktestResult, show: bool = False,
         hspace=0.48,
         wspace=0.28,
         left=0.06, right=0.97,
-        top=0.96, bottom=0.06,
+        top=0.96, bottom=0.05,
     )
 
     ax_hero   = fig.add_subplot(gs[0, :])
@@ -306,10 +306,12 @@ def plot(result: BacktestResult, show: bool = False,
 
     # ── Suptitle ──────────────────────────────────────────────────────────────
     n_years_label = round((equity.index[-1] - equity.index[0]).days / 365.25)
+    sizing_label  = (f"Order: ${config.ORDER_BALANCE_USD:,.0f} × {config.LEVERAGE}× lev"
+                     if config.ORDER_BALANCE_USD > 0
+                     else f"Risk/trade: {config.RISK_PERCENT}%  |  Leverage: {config.LEVERAGE}×")
     fig.suptitle(
         f"{n_years_label}-Year Backtest Report  |  BTCUSDT Futures  |  "
-        f"{period_start} → {period_end}  |  Leverage: {config.LEVERAGE}×  "
-        f"|  Risk/trade: {config.RISK_PERCENT}%",
+        f"{period_start} → {period_end}  |  {sizing_label}",
         color=TEXT, fontsize=10.5, y=0.99, fontweight="bold",
     )
 

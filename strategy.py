@@ -239,6 +239,19 @@ def evaluate(state: MarketState, bars_since_last_trade: int = 9999) -> Optional[
 
 def position_size_usdt(balance, entry, sl,
                        risk_pct=None, leverage=None) -> float:
+    """Return contract qty for a trade.
+
+    Priority (highest → lowest):
+      1. ORDER_BALANCE_USD > 0  →  fixed margin × leverage (ignores SL distance)
+      2. RISK_USD > 0           →  fixed-dollar risk, capped by margin
+      3. RISK_PERCENT           →  % of balance risk, capped by margin
+    """
+    # 1. Fixed order-balance sizing
+    if config.ORDER_BALANCE_USD > 0:
+        notional = config.ORDER_BALANCE_USD * max(config.LEVERAGE, 1)
+        return notional / entry
+
+    # 2 / 3. Risk-based sizing
     if config.RISK_USD > 0:
         risk = config.RISK_USD
     else:
