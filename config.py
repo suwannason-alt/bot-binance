@@ -1,3 +1,21 @@
+"""
+Bot configuration — all parameters read from environment variables.
+
+Environment variable loading priority:
+  1. Shell environment   (``export VAR=value``)
+  2. ``.env`` file       (loaded via python-dotenv)
+  3. Hard-coded default  (shown as the second argument of each ``os.getenv``)
+
+Key configuration sections:
+  - API credentials and symbol
+  - Risk and position sizing
+  - Indicator periods
+  - 1H strategy entry thresholds
+  - Trailing stop cascade
+  - Daily profit / loss limits
+  - Live trading safety guards
+  - Quantitative enhancements (all ``OFF`` by default — enable via ``.env``)
+"""
 import os
 from dotenv import load_dotenv
 
@@ -114,3 +132,68 @@ PRICE_TICK         = float(os.getenv("PRICE_TICK",    "0.10"))      # BTC price 
 
 # Heartbeat: log a status line every N seconds even with no trade activity.
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))    # 15 min
+
+# Consecutive-loss circuit breaker: halt today after N stop-losses in a row.
+# Prevents over-trading into an adverse market. Resets each UTC midnight.
+# 0 = off.  Recommended: 3 (stops a bad run before it compounds).
+MAX_CONSECUTIVE_LOSSES   = int(os.getenv("MAX_CONSECUTIVE_LOSSES",   "3"))
+
+# Post-SL cooldown: wait extra 1H bars before re-entering after a stop-loss.
+# Avoids immediately re-entering the same whipsaw that just hit your stop.
+# 0 = use normal TRADE_COOLDOWN_1H.  Recommended: 3 (= 3 h minimum gap after SL).
+POST_SL_COOLDOWN_1H      = int(os.getenv("POST_SL_COOLDOWN_1H",      "3"))
+
+# Session time filter: only open new positions between [START, END) UTC hours.
+# 0,0 = off (trade 24/7, proven maximum-growth mode).
+# Example: SESSION_FILTER_START_UTC=7  SESSION_FILTER_END_UTC=22
+#          → entries only 07:00–22:00 UTC (London + New York overlap).
+SESSION_FILTER_START_UTC = int(os.getenv("SESSION_FILTER_START_UTC", "0"))
+SESSION_FILTER_END_UTC   = int(os.getenv("SESSION_FILTER_END_UTC",   "0"))
+
+# Live position sync interval (seconds): how often to poll the exchange to detect
+# when an SL/TP order filled outside our WebSocket feed.
+# CRITICAL for live mode — without this the bot freezes after a remote SL fill.
+LIVE_POSITION_SYNC_SECS  = int(os.getenv("LIVE_POSITION_SYNC_SECS",  "30"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# QUANTITATIVE ENHANCEMENTS  (all OFF by default — enable via .env or sweep)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── 1. Market regime detection ────────────────────────────────────────────────
+# Classifies every bar as STRONG_TREND / WEAK_TREND / RANGING / HIGH_VOL.
+# RANGING  -> skip entry (most false breakouts originate here)
+# HIGH_VOL -> allow entry but scale position size down by HIGH_VOL_SIZE_SCALE
+REGIME_FILTER_ENABLED = os.getenv("REGIME_FILTER_ENABLED", "false").lower() == "true"
+REGIME_STRONG_ADX     = float(os.getenv("REGIME_STRONG_ADX",   "28.0"))  # ADX >= this -> STRONG_TREND
+REGIME_HIGH_VOL_PCT   = float(os.getenv("REGIME_HIGH_VOL_PCT", "4.5"))   # ATR% >= this -> HIGH_VOL
+HIGH_VOL_SIZE_SCALE   = float(os.getenv("HIGH_VOL_SIZE_SCALE", "0.5"))   # position multiplier in HIGH_VOL
+
+# ── 2. Dynamic TP / SL ────────────────────────────────────────────────────────
+# STRONG_TREND: extend TP (let big winners run, don't exit too early)
+# WEAK_TREND:   tighten TP (take profits before momentum fades)
+# Formula: effective_TP = ATR_TP_MULTIPLIER x regime_mult
+DYNAMIC_TP_ENABLED     = os.getenv("DYNAMIC_TP_ENABLED", "false").lower() == "true"
+DYNAMIC_TP_STRONG_MULT = float(os.getenv("DYNAMIC_TP_STRONG_MULT", "1.5"))  # 7.0 -> 10.5x in STRONG
+DYNAMIC_TP_WEAK_MULT   = float(os.getenv("DYNAMIC_TP_WEAK_MULT",   "0.7"))  # 7.0 ->  4.9x in WEAK
+
+# ── 3. Volatility-adjusted position sizing ────────────────────────────────────
+# Scales position size INVERSELY with current ATR regime so that expected
+# dollar-risk per trade stays roughly constant regardless of volatility.
+#   ATR_ratio 1.5x normal -> position x 0.67  (ATR expanded -> smaller position)
+#   ATR_ratio 0.7x normal -> position x 1.25  (ATR compressed -> larger position, capped)
+VOL_SIZING_ENABLED   = os.getenv("VOL_SIZING_ENABLED", "false").lower() == "true"
+VOL_SIZING_MAX_SCALE = float(os.getenv("VOL_SIZING_MAX_SCALE", "1.25"))  # max upscale (low-vol)
+VOL_SIZING_MIN_SCALE = float(os.getenv("VOL_SIZING_MIN_SCALE", "0.50"))  # max downscale (high-vol)
+
+# ── 4. Candle body quality filter ─────────────────────────────────────────────
+# Require the breakout candle to have a meaningful body (strong close, not a doji).
+# body_atr_ratio = |close - open| / ATR  ->  < threshold = indecision -> skip.
+# 0 = disabled.  Recommended range: 0.15 - 0.30.
+BODY_ATR_RATIO_MIN = float(os.getenv("BODY_ATR_RATIO_MIN", "0.0"))
+
+# ── 5. Limit-order entry (live trading fee optimisation) ──────────────────────
+# Post limit at the breakout close price -> maker rebate (0.02%) instead of
+# taker fee (0.05%).  Saves 60% on entry fees per trade.
+# Falls back to market if not filled within LIMIT_ENTRY_TIMEOUT seconds.
+USE_LIMIT_ENTRY     = os.getenv("USE_LIMIT_ENTRY", "false").lower() == "true"
+LIMIT_ENTRY_TIMEOUT = int(os.getenv("LIMIT_ENTRY_TIMEOUT", "45"))   # seconds before market fallback

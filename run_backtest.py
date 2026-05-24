@@ -12,14 +12,14 @@ Usage:
 import argparse
 import asyncio
 import logging
-import math
 import sys
+from typing import Dict, List, Optional
 
 import pandas as pd
 
+import backtest
 import config
 import fetch_data
-import backtest
 import visualize
 
 logging.basicConfig(
@@ -31,11 +31,11 @@ logger = logging.getLogger("run_backtest")
 
 # Defaults — overridden by CLI args
 INITIAL_BALANCE = 1000.0
-YEARS = 5
+YEARS = 7
 DAYS  = YEARS * 365
 
 # ── Base parameters (proven 3-year core) ─────────────────────────────────────
-_BASE = {
+_BASE: Dict = {
     "ATR_SL_MULTIPLIER":       1.5,
     "ATR_TP_MULTIPLIER":       5.0,
     "ATR_RATIO_MIN":           1.15,
@@ -67,6 +67,18 @@ _BASE = {
     "REQUIRE_MACD_CONFIRM":    False,
     "BREAKOUT_ATR_BUFFER":     0.0,
     "EMA_TREND_DISTANCE_MIN":  0.0,
+    # Quant enhancement defaults (all off — overridden per candidate)
+    "REGIME_FILTER_ENABLED":   False,
+    "REGIME_STRONG_ADX":       28.0,
+    "REGIME_HIGH_VOL_PCT":     4.5,
+    "HIGH_VOL_SIZE_SCALE":     0.5,
+    "DYNAMIC_TP_ENABLED":      False,
+    "DYNAMIC_TP_STRONG_MULT":  1.5,
+    "DYNAMIC_TP_WEAK_MULT":    0.7,
+    "VOL_SIZING_ENABLED":      False,
+    "VOL_SIZING_MAX_SCALE":    1.25,
+    "VOL_SIZING_MIN_SCALE":    0.50,
+    "BODY_ATR_RATIO_MIN":      0.0,
 }
 
 # ── Parameter candidates (tried in order until goal is met) ──────────────────
@@ -83,7 +95,7 @@ _BASE = {
 #
 # Primary fix: raise ATR_TP_MULTIPLIER (more payout per win, WR barely changes).
 # Secondary: lower ADX slightly (more trades during Y2 recovery Dec22-May23).
-PARAM_CANDIDATES = [
+PARAM_CANDIDATES: List[Dict] = [
     # 0: Original 3yr-proven
     {**_BASE},
 
@@ -380,73 +392,288 @@ PARAM_CANDIDATES = [
     # 73: TRAIL_STOP=1.5 + TRAIL_ACTIVATE=1.5 + no LOCK (trail does everything)
     {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 20.0, "ATR_TP_MULTIPLIER": 7.0,
      "BREAKOUT_PERIOD": 14, "TRAIL_STOP_ATR": 1.5},
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # QUANTITATIVE ENHANCEMENT CANDIDATES  (74 onwards)
+    # Base: best known 6yr config -> ADX=25 BP=14 TP=7 LOCK=4 RISK=8%
+    # Each candidate isolates or combines one enhancement to measure impact.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # ── Feature isolation ─────────────────────────────────────────────────────
+
+    # 74: Regime filter only — skip RANGING bars
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True},
+
+    # 75: Dynamic TP only — extend TP in STRONG_TREND, tighten in WEAK_TREND
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "DYNAMIC_TP_ENABLED": True},
+
+    # 76: Vol-adjusted sizing only — smaller position when ATR is expanded
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "VOL_SIZING_ENABLED": True},
+
+    # 77: Body quality filter only — skip doji candles at breakout
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "BODY_ATR_RATIO_MIN": 0.2},
+
+    # 78: MACD confirm only — require histogram direction matches breakout
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REQUIRE_MACD_CONFIRM": True},
+
+    # 79: Volume quality gate only — require > 80% average volume
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "VOL_RATIO_MIN": 0.8},
+
+    # ── Stacking enhancements (additive) ─────────────────────────────────────
+
+    # 80: Regime + Dynamic TP (most impactful pair)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True},
+
+    # 81: Regime + Dynamic TP + Vol-sizing
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True},
+
+    # 82: Regime + Dynamic TP + Vol-sizing + Body filter (full stack)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True, "BODY_ATR_RATIO_MIN": 0.2},
+
+    # 83: Full stack + MACD confirm (most selective)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True, "BODY_ATR_RATIO_MIN": 0.2,
+     "REQUIRE_MACD_CONFIRM": True},
+
+    # 84: Full stack + Vol filter 0.8 (volume quality instead of body filter)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True, "VOL_RATIO_MIN": 0.8},
+
+    # ── Dynamic TP tuning (strong/weak multipliers) ───────────────────────────
+
+    # 85: Regime + Dynamic TP with stronger extension (2.0x in STRONG_TREND)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "DYNAMIC_TP_STRONG_MULT": 2.0, "DYNAMIC_TP_WEAK_MULT": 0.7},
+
+    # 86: Regime + Dynamic TP with moderate extension (1.3x)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "DYNAMIC_TP_STRONG_MULT": 1.3, "DYNAMIC_TP_WEAK_MULT": 0.8},
+
+    # ── Regime threshold tuning ───────────────────────────────────────────────
+
+    # 87: Stricter strong-trend threshold (ADX 32 for extended TP)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "REGIME_STRONG_ADX": 32.0},
+
+    # 88: Looser strong-trend threshold (ADX 24 for extended TP)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "REGIME_STRONG_ADX": 24.0},
+
+    # ── Vol-sizing scale tuning ───────────────────────────────────────────────
+
+    # 89: Aggressive vol-scaling (tighter band: 0.4x – 1.5x)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True,
+     "VOL_SIZING_MAX_SCALE": 1.5, "VOL_SIZING_MIN_SCALE": 0.4},
+
+    # 90: Conservative vol-scaling (wider band: 0.6x – 1.1x)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True,
+     "VOL_SIZING_MAX_SCALE": 1.1, "VOL_SIZING_MIN_SCALE": 0.6},
+
+    # ── Body filter tuning ────────────────────────────────────────────────────
+
+    # 91: Softer body filter (0.15 ATR)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "BODY_ATR_RATIO_MIN": 0.15},
+
+    # 92: Tighter body filter (0.30 ATR)
+    {**_BASE, "RISK_PERCENT": 8.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "BODY_ATR_RATIO_MIN": 0.30},
+
+    # ── Best-effort: all signals quality-filtered, max compounding ────────────
+
+    # 93: RISK=10% + full stack (more aggressive compounding with better signals)
+    {**_BASE, "RISK_PERCENT": 10.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True, "BODY_ATR_RATIO_MIN": 0.2},
+
+    # 94: RISK=12% + full stack (even more aggressive)
+    {**_BASE, "RISK_PERCENT": 12.0, "ADX_MIN": 25.0, "ATR_TP_MULTIPLIER": 7.0,
+     "BREAKOUT_PERIOD": 14, "TRAIL_LOCK_ATR": 4.0,
+     "REGIME_FILTER_ENABLED": True, "DYNAMIC_TP_ENABLED": True,
+     "VOL_SIZING_ENABLED": True, "BODY_ATR_RATIO_MIN": 0.2},
 ]
 
 
-def _apply_params(params: dict):
-    for k, v in params.items():
-        if hasattr(config, k):
-            setattr(config, k, v)
+def _apply_params(params: Dict) -> None:
+    """Apply a parameter dictionary to the live ``config`` module.
+
+    Sets each key in ``params`` as an attribute on ``config``, then ensures
+    ``MIN_CANDLES_1H`` is at least ``EMA_TREND + 10`` so the strategy has
+    enough warm-up bars.
+
+    Args:
+        params: Mapping of config attribute names to their new values.
+    """
+    for key, value in params.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
     config.MIN_CANDLES_1H = max(config.MIN_CANDLES_1H, config.EMA_TREND + 10)
 
 
 def _year_end_balance(equity: pd.Series, cutoff: pd.Timestamp) -> float:
+    """Return the equity-curve value at or immediately before ``cutoff``.
+
+    Args:
+        equity: Time-indexed equity curve from a backtest result.
+        cutoff: Upper bound timestamp (inclusive).
+
+    Returns:
+        Last equity value on or before ``cutoff``, or the final equity value
+        if ``cutoff`` is beyond the series end.
+    """
     subset = equity[equity.index <= cutoff]
     return float(subset.iloc[-1]) if len(subset) else float(equity.iloc[-1])
 
 
-def _year_trade_breakdown(result, cutoffs: list) -> list[dict]:
-    """Per-year TP/SL/BE/EOD counts."""
-    equity = result.equity_curve
+def _year_trade_breakdown(result, cutoffs: List[pd.Timestamp]) -> List[Dict]:
+    """Compute per-year trade statistics from a backtest result.
+
+    Slices ``result.trades`` into annual windows defined by ``cutoffs`` and
+    counts exit types and trade directions for each year.
+
+    Args:
+        result: Backtest result object with ``equity_curve`` and ``trades``
+            attributes.
+        cutoffs: List of year-boundary timestamps (``len(cutoffs) == years - 1``).
+
+    Returns:
+        List of dicts — one per year — each containing:
+          ``n``, ``tp``, ``sl``, ``be``, ``long``, ``short`` counts.
+    """
+    equity     = result.equity_curve
     boundaries = [equity.index[0]] + list(cutoffs) + [equity.index[-1]]
-    rows = []
+    rows: List[Dict] = []
+
     for yi in range(len(boundaries) - 1):
-        t_s = boundaries[yi]; t_e = boundaries[yi + 1]
-        yt = [t for t in result.trades if t_s <= t.entry_time < t_e]
+        t_start = boundaries[yi]
+        t_end   = boundaries[yi + 1]
+        year_trades = [t for t in result.trades if t_start <= t.entry_time < t_end]
         rows.append({
-            "n":      len(yt),
-            "tp":     sum(1 for t in yt if t.close_reason == "TP"),
-            "sl":     sum(1 for t in yt if t.close_reason == "SL"),
-            "be":     sum(1 for t in yt if t.close_reason == "BE"),
-            "long":   sum(1 for t in yt if t.side == "LONG"),
-            "short":  sum(1 for t in yt if t.side == "SHORT"),
+            "n":     len(year_trades),
+            "tp":    sum(1 for t in year_trades if t.close_reason == "TP"),
+            "sl":    sum(1 for t in year_trades if t.close_reason == "SL"),
+            "be":    sum(1 for t in year_trades if t.close_reason == "BE"),
+            "long":  sum(1 for t in year_trades if t.side == "LONG"),
+            "short": sum(1 for t in year_trades if t.side == "SHORT"),
         })
     return rows
 
 
-def _print_result(params: dict, balances: list, year_ok: list, stats: dict,
-                  attempt: int, total: int, result=None, cutoffs=None, years: int = YEARS):
+def _print_result(
+    params: Dict,
+    balances: List[float],
+    year_ok: List[bool],
+    stats: Dict,
+    attempt: int,
+    total: int,
+    result=None,
+    cutoffs: Optional[List[pd.Timestamp]] = None,
+    years: int = YEARS,
+) -> None:
+    """Print a formatted backtest result summary to stdout.
+
+    Args:
+        params:   Parameter dictionary used for this backtest run.
+        balances: List of year-boundary balances (length ``years + 1``).
+        year_ok:  Boolean list indicating whether each year was profitable.
+        stats:    Statistics dictionary from ``backtest.run().stats``.
+        attempt:  Current candidate index (1-based).
+        total:    Total number of candidates being tried.
+        result:   Backtest result object (optional; needed for trade breakdown).
+        cutoffs:  Year-boundary timestamps (optional; needed for trade breakdown).
+        years:    Number of years in the backtest window.
+    """
     goal_met = all(year_ok)
-    risk      = params.get("RISK_PERCENT", "?")
-    adx       = params.get("ADX_MIN", 0)
-    slope     = params.get("EMA_SLOPE_MIN_PCT", 0)
-    tp        = params.get("ATR_TP_MULTIPLIER", 5.0)
-    leverage  = params.get("LEVERAGE", 10)
-    ord_bal   = params.get("ORDER_BALANCE_USD", 0.0)
-    sizing    = (f"ORDER_BAL=${ord_bal:.0f}×{leverage}lev"
-                 if ord_bal > 0 else f"RISK={risk}% LEV={leverage}×")
+    risk     = params.get("RISK_PERCENT", "?")
+    adx      = params.get("ADX_MIN", 0)
+    slope    = params.get("EMA_SLOPE_MIN_PCT", 0)
+    tp       = params.get("ATR_TP_MULTIPLIER", 5.0)
+    leverage = params.get("LEVERAGE", 10)
+    ord_bal  = params.get("ORDER_BALANCE_USD", 0.0)
+    sizing   = (f"ORDER_BAL=${ord_bal:.0f}×{leverage}lev"
+                if ord_bal > 0 else f"RISK={risk}% LEV={leverage}×")
+
+    # Collect active quant-enhancement flags for display
+    flags: List[str] = []
+    if params.get("REGIME_FILTER_ENABLED"):
+        flags.append("REGIME")
+    if params.get("DYNAMIC_TP_ENABLED"):
+        flags.append("DYN_TP")
+    if params.get("VOL_SIZING_ENABLED"):
+        flags.append("VOL_SZ")
+    if params.get("BODY_ATR_RATIO_MIN", 0) > 0:
+        flags.append(f"BODY{params['BODY_ATR_RATIO_MIN']:.2f}")
+    if params.get("REQUIRE_MACD_CONFIRM"):
+        flags.append("MACD")
+    flags_str = "  [" + " ".join(flags) + "]" if flags else ""
+
     print()
     print("=" * 72)
     print(f"  {years}-YEAR BACKTEST  [attempt {attempt}/{total}]"
-          f"  {sizing}  ADX≥{adx}  SLOPE≥{slope}  TP×{tp}")
+          f"  {sizing}  ADX≥{adx}  SLOPE≥{slope}  TP×{tp}{flags_str}")
     print("=" * 72)
 
     yr_rows = _year_trade_breakdown(result, cutoffs) if result and cutoffs else []
     for i in range(years):
-        b_s = balances[i]; b_e = balances[i + 1]
-        r   = (b_e - b_s) / b_s * 100
+        b_start = balances[i]
+        b_end   = balances[i + 1]
+        ret     = (b_end - b_start) / b_start * 100
+        detail  = ""
         if i < len(yr_rows):
-            yr = yr_rows[i]
+            yr     = yr_rows[i]
             detail = (f"  [{yr['n']}t: TP={yr['tp']} SL={yr['sl']} BE={yr['be']}"
                       f" | {yr['long']}L {yr['short']}S]")
-        else:
-            detail = ""
-        print(f"  Year {i+1}  ${b_s:>10,.2f}  →  ${b_e:>10,.2f}"
-              f"  {'+' if r>=0 else ''}{r:.1f}%  {'✓' if year_ok[i] else '✗'}{detail}")
+        print(f"  Year {i+1}  ${b_start:>10,.2f}  →  ${b_end:>10,.2f}"
+              f"  {'+' if ret >= 0 else ''}{ret:.1f}%  "
+              f"{'✓' if year_ok[i] else '✗'}{detail}")
+
     print("─" * 72)
     print(f"  Trades       : {stats.get('total_trades', 0)}"
-          f"  (TP={stats.get('tp_exits',0)} SL={stats.get('sl_exits',0)}"
-          f" BE={stats.get('be_exits',0)})")
+          f"  (TP={stats.get('tp_exits', 0)} SL={stats.get('sl_exits', 0)}"
+          f" BE={stats.get('be_exits', 0)})")
     print(f"  Win rate     : {stats.get('win_rate', 0):.1f}%")
     print(f"  Max drawdown : {stats.get('max_drawdown_pct', 0):.1f}%")
     print(f"  CAGR         : {stats.get('cagr_pct', 0):+.1f}%/yr")
@@ -457,9 +684,29 @@ def _print_result(params: dict, balances: list, year_ok: list, stats: dict,
     print("=" * 72)
 
 
-def main(days: int = DAYS, initial_balance: float = INITIAL_BALANCE,
-         years: int = YEARS, symbol: str = "BTCUSDT"):
-    logger.info(f"Fetching {days}-day data ({years} year{'s' if years!=1 else ''})…")
+def main(
+    days: int = DAYS,
+    initial_balance: float = INITIAL_BALANCE,
+    years: int = YEARS,
+    symbol: str = "BTCUSDT",
+) -> bool:
+    """Run the parameter sweep and return whether the all-years goal was met.
+
+    Iterates through ``PARAM_CANDIDATES`` in order, applying each set of
+    parameters, running a full backtest, and stopping on the first candidate
+    where every year is profitable.  Generates a chart for the best result.
+
+    Args:
+        days:            Number of calendar days of historical data to use.
+        initial_balance: Starting balance in USDT.
+        years:           Number of calendar years in the backtest window.
+        symbol:          Trading pair symbol (e.g. ``"BTCUSDT"``).
+
+    Returns:
+        ``True`` if at least one candidate achieved the all-years goal,
+        ``False`` otherwise.
+    """
+    logger.info(f"Fetching {days}-day data ({years} year{'s' if years != 1 else ''})…")
     df_5m, df_1h = asyncio.run(fetch_data.fetch_all(symbol=symbol, days=days))
 
     t0 = pd.Timestamp(df_5m["open_time"].iloc[0], unit="ms")
@@ -467,18 +714,20 @@ def main(days: int = DAYS, initial_balance: float = INITIAL_BALANCE,
     logger.info(f"Period: {t0:%Y-%m-%d} → {tN:%Y-%m-%d}"
                 f"  5M={len(df_5m):,}  1H={len(df_1h):,}")
 
-    best_result      = None
-    best_params      = None
-    best_balances    = None
-    best_cutoffs     = None
-    best_goal_met    = False
-    final_goal_met   = False
+    best_result:   Optional[object]          = None
+    best_params:   Optional[Dict]            = None
+    best_balances: Optional[List[float]]     = None
+    best_cutoffs:  Optional[List[pd.Timestamp]] = None
+    best_goal_met: bool                      = False
+    final_goal_met: bool                     = False
 
     for attempt, params in enumerate(PARAM_CANDIDATES, 1):
         _apply_params(params)
-        logger.info(f"Attempt {attempt}/{len(PARAM_CANDIDATES)} — "
-                    f"RISK={params['RISK_PERCENT']}%  ADX≥{params['ADX_MIN']}"
-                    f"  SLOPE≥{params['EMA_SLOPE_MIN_PCT']}")
+        logger.info(
+            f"Attempt {attempt}/{len(PARAM_CANDIDATES)} — "
+            f"RISK={params['RISK_PERCENT']}%  ADX≥{params['ADX_MIN']}"
+            f"  SLOPE≥{params['EMA_SLOPE_MIN_PCT']}"
+        )
 
         result = backtest.run(df_5m, df_1h, initial_balance=initial_balance, mode="1h")
         stats  = result.stats
@@ -487,18 +736,23 @@ def main(days: int = DAYS, initial_balance: float = INITIAL_BALANCE,
         eq_start = equity.index[0]
         # For 1-year runs there are no intermediate cutoffs
         cutoffs  = [eq_start + pd.DateOffset(years=y) for y in range(1, years)]
-        balances = ([initial_balance]
-                    + [_year_end_balance(equity, c) for c in cutoffs]
-                    + [float(equity.iloc[-1])])
+        balances = (
+            [initial_balance]
+            + [_year_end_balance(equity, c) for c in cutoffs]
+            + [float(equity.iloc[-1])]
+        )
 
         year_ok  = [balances[i + 1] > balances[i] for i in range(years)]
         goal_met = all(year_ok)
 
-        _print_result(params, balances, year_ok, stats, attempt, len(PARAM_CANDIDATES),
-                      result=result, cutoffs=cutoffs, years=years)
+        _print_result(
+            params, balances, year_ok, stats,
+            attempt, len(PARAM_CANDIDATES),
+            result=result, cutoffs=cutoffs, years=years,
+        )
 
         if goal_met:
-            if not best_goal_met or balances[-1] > best_balances[-1]:
+            if not best_goal_met or balances[-1] > (best_balances[-1] if best_balances else 0):
                 best_result   = result
                 best_params   = params
                 best_balances = balances
@@ -524,23 +778,39 @@ def main(days: int = DAYS, initial_balance: float = INITIAL_BALANCE,
     return final_goal_met
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="BTCUSDT backtest runner")
-    p.add_argument("--days",          type=int,   default=None,
-                   help="Number of calendar days to backtest (default: 5×365=1825)")
-    p.add_argument("--balance",       type=float, default=None,
-                   help="Starting balance in USD (default: 1000)")
-    p.add_argument("--symbol",        type=str,   default="BTCUSDT")
-    p.add_argument("--leverage",      type=int,   default=None,
-                   help="Futures leverage multiplier (default: 10). "
-                        "Used to cap max position size (risk-based) or to set "
-                        "notional when --order-balance is given.")
-    p.add_argument("--order-balance", type=float, default=None,
-                   help="Fixed margin per order in USD (default: 0 = disabled). "
-                        "When set, each trade uses ORDER_BALANCE × LEVERAGE notional "
-                        "regardless of SL distance. Example: --order-balance 100 "
-                        "--leverage 10 → $1 000 notional per trade.")
-    return p.parse_args()
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the backtest runner.
+
+    Returns:
+        Parsed :class:`argparse.Namespace` with attributes:
+          ``days``, ``balance``, ``symbol``, ``leverage``, ``order_balance``.
+    """
+    parser = argparse.ArgumentParser(description="BTCUSDT backtest runner")
+    parser.add_argument(
+        "--days", type=int, default=None,
+        help="Number of calendar days to backtest (default: 5×365=1825)",
+    )
+    parser.add_argument(
+        "--balance", type=float, default=None,
+        help="Starting balance in USD (default: 1000)",
+    )
+    parser.add_argument(
+        "--symbol", type=str, default="BTCUSDT",
+    )
+    parser.add_argument(
+        "--leverage", type=int, default=None,
+        help="Futures leverage multiplier (default: 10).  "
+             "Used to cap max position size (risk-based) or to set "
+             "notional when --order-balance is given.",
+    )
+    parser.add_argument(
+        "--order-balance", type=float, default=None,
+        help="Fixed margin per order in USD (default: 0 = disabled).  "
+             "When set, each trade uses ORDER_BALANCE × LEVERAGE notional "
+             "regardless of SL distance.  Example: --order-balance 100 "
+             "--leverage 10 → $1 000 notional per trade.",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

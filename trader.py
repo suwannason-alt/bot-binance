@@ -1,12 +1,19 @@
 """
 Order execution layer.
 Paper mode simulates fills; live mode uses ccxt Binance Futures.
+
+Order-entry flow (live mode):
+  USE_LIMIT_ENTRY=true  → post limit at close price (maker fee 0.02%)
+                           wait up to LIMIT_ENTRY_TIMEOUT s for fill
+                           → if not filled, cancel and fall back to market order
+  USE_LIMIT_ENTRY=false → market order (taker fee 0.05%)
 """
 import asyncio
 import logging
+import time as _time
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime, timezone
+from typing import Dict, List, Optional
 
 import config
 from strategy import Signal, position_size_usdt
@@ -16,7 +23,28 @@ logger = logging.getLogger("trader")
 
 @dataclass
 class Position:
-    side: str           # "LONG" | "SHORT"
+    """An open or closed trade position.
+
+    Attributes:
+        side: Trade direction — ``"LONG"`` or ``"SHORT"``.
+        entry: Fill price at which the position was opened.
+        qty: Contract quantity.
+        sl: Current stop-loss price (updated as trailing stop activates).
+        tp: Take-profit price (fixed at entry).
+        open_time: ISO-8601 UTC timestamp of when the position was opened.
+        pnl: Realised profit / loss in USDT (set on close).
+        closed: ``True`` once the position has been exited.
+        close_reason: Exit trigger — ``"TP"``, ``"SL"``, or ``"BE"``.
+        trail_activated: ``True`` once break-even has been activated
+            (price moved ``TRAIL_ACTIVATE_ATR × initial_atr`` in favour).
+        lock_activated: ``True`` once the profit-lock trail stage has fired.
+        trail_peak: Highest price seen (LONG) or lowest price seen (SHORT)
+            since break-even activation; used by the dynamic trailing stop.
+        initial_atr: ATR value at entry — the reference for all trail thresholds.
+        sl_order_id: Exchange stop-market order ID (live mode only).
+    """
+
+    side: str
     entry: float
     qty: float
     sl: float
@@ -25,14 +53,34 @@ class Position:
     pnl: float = 0.0
     closed: bool = False
     close_reason: str = ""
-    trail_activated: bool = False   # True once BE activated (price moved TRAIL_ACTIVATE_ATR×ATR)
-    lock_activated: bool = False    # True once profit lock activated (TRAIL_LOCK_ATR)
-    trail_peak: float = 0.0        # highest (LONG) / lowest (SHORT) price seen after BE
-    initial_atr: float = 0.0       # ATR at entry — used for all trail thresholds
-    sl_order_id: Optional[str] = None  # exchange SL order ID (live mode only)
+    trail_activated: bool = False
+    lock_activated: bool = False
+    trail_peak: float = 0.0
+    initial_atr: float = 0.0
+    sl_order_id: Optional[str] = None
 
 
 class Trader:
+    """Manages order execution and trade lifecycle for both paper and live modes.
+
+    In paper mode all fills are simulated locally against the mark price.
+    In live mode orders are routed to Binance USDM Futures via the ``ccxt``
+    library, with optional limit-order entry and a periodic sync poll that
+    detects when the exchange has filled an SL/TP order server-side.
+
+    Attributes:
+        position:          Currently open :class:`Position`, or ``None``.
+        balance:           Current account balance in USDT.
+        trade_log:         Ordered list of all closed :class:`Position` objects.
+        day_start_balance: Balance at the start of the current UTC day.
+        daily_halted:      ``True`` when today's profit or loss limit has been hit.
+        daily_profit_hit:  ``True`` only when the profit target was the trigger.
+        days_profit_hit:   Cumulative count of days where profit target was reached.
+        days_loss_hit:     Cumulative count of days where loss limit was reached.
+        total_days:        Total UTC days elapsed since the session started.
+        consecutive_losses: Count of consecutive stop-loss exits (resets daily).
+    """
+
     def __init__(self):
         self.position: Optional[Position] = None
         self.balance: float = 1000.0  # paper balance; overwritten on live init
@@ -48,6 +96,12 @@ class Trader:
         self.days_loss_hit: int = 0
         self.total_days: int = 0
 
+        # Consecutive-loss circuit breaker (resets each UTC day)
+        self.consecutive_losses: int = 0
+
+        # Live position sync — avoid spamming the exchange API
+        self._last_sync_time: float = 0.0
+
         if not config.PAPER_TRADING:
             self._init_live()
 
@@ -57,8 +111,12 @@ class Trader:
     def _utc_date() -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    def reset_day(self):
-        """Call once per day (at UTC midnight) to reset daily tracking."""
+    def reset_day(self) -> None:
+        """Reset daily tracking counters at UTC midnight.
+
+        Idempotent — safe to call on every tick.  The reset only fires once
+        per calendar day (checked via the stored UTC date string).
+        """
         today = self._utc_date()
         if today == self._today_date:
             return  # already reset today
@@ -73,6 +131,7 @@ class Trader:
         self.day_start_balance = self.balance
         self.daily_halted = False
         self.daily_profit_hit = False
+        self.consecutive_losses = 0           # circuit breaker resets every day
         logger.info(
             f"New day {today} — balance={self.balance:.2f}  "
             f"all-time profit_days={self.days_profit_hit}  loss_days={self.days_loss_hit}"
@@ -80,9 +139,16 @@ class Trader:
 
     @property
     def day_pnl(self) -> float:
+        """Current day's unrealised + realised PnL relative to day-start balance."""
         return self.balance - self.day_start_balance
 
-    def _check_daily_limits(self):
+    def _check_daily_limits(self) -> None:
+        """Evaluate daily profit / loss thresholds and halt trading if exceeded.
+
+        Sets ``daily_halted = True`` when either threshold is breached.
+        Also sets ``daily_profit_hit = True`` when the profit target fires.
+        No-op if ``daily_halted`` is already ``True``.
+        """
         if self.daily_halted:
             return
         pnl = self.day_pnl
@@ -120,7 +186,13 @@ class Trader:
 
     # ── Exchange helpers ──────────────────────────────────────────────────────
 
-    def _init_live(self):
+    def _init_live(self) -> None:
+        """Initialise the ``ccxt`` Binance USDM Futures exchange connection.
+
+        Raises:
+            Exception: Re-raises any ccxt connection or credential error after
+                logging it, so the calling constructor propagates the failure.
+        """
         try:
             import ccxt
             self._exchange = ccxt.binanceusdm({
@@ -134,19 +206,21 @@ class Trader:
             logger.error(f"Failed to connect to Binance: {e}")
             raise
 
-    async def initialize(self):
-        """Fetch balance and recover any existing position on startup."""
+    async def initialize(self) -> None:
+        """Fetch live balance and recover any open position on startup."""
         if not config.PAPER_TRADING:
             self.balance = await self.fetch_balance()
             self.day_start_balance = self.balance
             logger.info(f"Live balance: {self.balance:.2f} USDT")
             await self._recover_position()
 
-    async def _recover_position(self):
-        """
-        On startup / reconnect, sync internal state with the exchange.
-        If an open position exists (e.g. after a crash), rebuild a Position
-        object so SL/TP monitoring continues without missing an exit.
+    async def _recover_position(self) -> None:
+        """Sync internal state with the exchange on startup or reconnect.
+
+        If an open position exists (e.g. after a process crash), this method
+        rebuilds a :class:`Position` object so SL/TP monitoring resumes
+        without missing an exit.  ATR is estimated at 1.5% of entry price
+        when the actual value is unknown; it improves after the next 1H bar.
         """
         loop = asyncio.get_event_loop()
         try:
@@ -197,6 +271,14 @@ class Trader:
             logger.error(f"[LIVE] Position recovery failed: {e}")
 
     async def fetch_balance(self) -> float:
+        """Return the current free USDT balance.
+
+        In paper mode, returns the simulated ``self.balance`` immediately.
+        In live mode, queries the exchange via ``ccxt.fetch_balance()``.
+
+        Returns:
+            Free USDT balance as a float.
+        """
         if config.PAPER_TRADING:
             return self.balance
         loop = asyncio.get_event_loop()
@@ -212,9 +294,19 @@ class Trader:
         if self.daily_halted:
             logger.debug("Daily limit reached — skipping new signal")
             return None
+        if config.MAX_CONSECUTIVE_LOSSES > 0 and self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            logger.info(
+                f"Consecutive-loss circuit breaker: {self.consecutive_losses} SLs in a row "
+                f"(max={config.MAX_CONSECUTIVE_LOSSES}) — no new entry today"
+            )
+            return None
 
         balance = await self.fetch_balance()
-        raw_qty = position_size_usdt(balance, signal.entry, signal.sl)
+        raw_qty = position_size_usdt(
+            balance, signal.entry, signal.sl,
+            atr_ratio=signal.indicators_1h.get("atr_ratio"),
+            size_scale=signal.size_scale,
+        )
         qty     = self._round_qty(raw_qty)
 
         if qty < config.MIN_ORDER_QTY:
@@ -230,10 +322,12 @@ class Trader:
             else (f"RISK_USD=${config.RISK_USD:.0f}" if config.RISK_USD > 0
                   else f"RISK={config.RISK_PERCENT}%")
         )
+        regime_str = getattr(signal, "regime", "?")
         logger.info(
             f"[{'PAPER' if config.PAPER_TRADING else 'LIVE'}] "
             f"Opening {signal.side} {qty:.4f} {config.SYMBOL} @ {signal.entry:.2f}  "
-            f"SL={signal.sl:.2f}  TP={signal.tp:.2f}  {risk_label}  {signal.reason}"
+            f"SL={signal.sl:.2f}  TP={signal.tp:.2f}  "
+            f"{risk_label}  regime={regime_str}  {signal.reason}"
         )
 
         sl_order_id = None
@@ -256,20 +350,16 @@ class Trader:
 
     async def _place_live_order(self, signal: Signal, qty: float) -> Optional[str]:
         """
-        Place market entry + SL + TP orders on Binance Futures.
-
-        Returns the SL order ID on success.
-        Returns None if entry failed (no position opened) or if SL placement
-        failed after entry (emergency market-close is triggered automatically).
+        Dispatch to limit-entry or market-entry based on USE_LIMIT_ENTRY config.
+        Returns SL order ID on success, None on failure (caller aborts).
         """
-        loop = asyncio.get_event_loop()
-        sym      = config.SYMBOL_CCXT
-        side_in  = "buy"  if signal.side == "LONG" else "sell"
-        side_out = "sell" if signal.side == "LONG" else "buy"
-        sl_price = self._round_price(signal.sl)
-        tp_price = self._round_price(signal.tp)
+        if config.USE_LIMIT_ENTRY:
+            return await self._place_limit_entry(signal, qty)
+        return await self._place_market_entry(signal, qty)
 
-        # ── Set leverage (non-fatal if exchange rejects repeated calls) ──────
+    async def _set_leverage_safe(self, sym: str):
+        """Set leverage; swallow repeated-call errors from the exchange."""
+        loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
                 None, lambda: self._exchange.set_leverage(config.LEVERAGE, sym)
@@ -277,17 +367,21 @@ class Trader:
         except Exception as e:
             logger.warning(f"[LIVE] set_leverage warning (continuing): {e}")
 
-        # ── Market entry ──────────────────────────────────────────────────────
-        try:
-            await loop.run_in_executor(
-                None, lambda: self._exchange.create_order(sym, "market", side_in, qty)
-            )
-            logger.info(f"[LIVE] Market {signal.side} {qty:.4f} filled")
-        except Exception as e:
-            logger.error(f"[LIVE] Market entry failed — no position opened: {e}")
-            return None  # entry never happened; caller will abort
+    async def _place_sl_tp_orders(
+        self, sym: str, signal: Signal, qty: float
+    ) -> Optional[str]:
+        """
+        Place SL + TP protective orders after an entry fill.
+        SL is critical — emergency market-close fires if it fails.
+        TP is best-effort.
+        Returns SL order ID or None (position closed by emergency handler).
+        """
+        loop     = asyncio.get_event_loop()
+        side_out = "sell" if signal.side == "LONG" else "buy"
+        sl_price = self._round_price(signal.sl)
+        tp_price = self._round_price(signal.tp)
 
-        # ── Stop-loss order (CRITICAL — if this fails, emergency-close) ──────
+        # ── Stop-loss (CRITICAL) ──────────────────────────────────────────────
         sl_order_id = None
         try:
             sl_order = await loop.run_in_executor(
@@ -298,26 +392,22 @@ class Trader:
                 ),
             )
             sl_order_id = sl_order.get("id") if sl_order else None
-            logger.info(f"[LIVE] SL order placed @ {sl_price}  id={sl_order_id}")
+            logger.info(f"[LIVE] SL placed @ {sl_price}  id={sl_order_id}")
         except Exception as e:
-            logger.error(
-                f"[LIVE] SL placement failed: {e}  "
-                f"→ EMERGENCY CLOSE to avoid unprotected position"
-            )
+            logger.error(f"[LIVE] SL placement FAILED: {e}  → EMERGENCY CLOSE")
             try:
                 await loop.run_in_executor(
                     None,
                     lambda: self._exchange.create_order(
-                        sym, "market", side_out, qty,
-                        params={"reduceOnly": True},
+                        sym, "market", side_out, qty, params={"reduceOnly": True}
                     ),
                 )
-                logger.info("[LIVE] Emergency close executed successfully")
+                logger.info("[LIVE] Emergency close executed")
             except Exception as e2:
-                logger.error(f"[LIVE] Emergency close ALSO failed: {e2} — manual intervention required!")
-            return None  # signal to caller: position was closed
+                logger.error(f"[LIVE] Emergency close FAILED too: {e2} — MANUAL ACTION REQUIRED")
+            return None
 
-        # ── Take-profit order (best-effort; exchange also manages it) ────────
+        # ── Take-profit (best-effort) ─────────────────────────────────────────
         try:
             await loop.run_in_executor(
                 None,
@@ -326,19 +416,150 @@ class Trader:
                     params={"stopPrice": tp_price, "reduceOnly": True},
                 ),
             )
-            logger.info(f"[LIVE] TP order placed @ {tp_price}")
+            logger.info(f"[LIVE] TP placed @ {tp_price}")
         except Exception as e:
-            logger.warning(f"[LIVE] TP order failed (non-critical, SL still active): {e}")
+            logger.warning(f"[LIVE] TP placement failed (SL still active): {e}")
 
         return sl_order_id
 
+    async def _place_market_entry(self, signal: Signal, qty: float) -> Optional[str]:
+        """Market-order entry (taker fee 0.05%). Reliable but more expensive."""
+        loop    = asyncio.get_event_loop()
+        sym     = config.SYMBOL_CCXT
+        side_in = "buy" if signal.side == "LONG" else "sell"
+
+        await self._set_leverage_safe(sym)
+
+        try:
+            await loop.run_in_executor(
+                None, lambda: self._exchange.create_order(sym, "market", side_in, qty)
+            )
+            logger.info(f"[LIVE] Market {signal.side} {qty:.4f} filled (taker)")
+        except Exception as e:
+            logger.error(f"[LIVE] Market entry failed: {e}")
+            return None
+
+        return await self._place_sl_tp_orders(sym, signal, qty)
+
+    async def _place_limit_entry(self, signal: Signal, qty: float) -> Optional[str]:
+        """
+        Post-only limit entry to capture maker rebate (0.02% vs 0.05% taker).
+
+        Places limit at the breakout close price (the 1H candle just closed at
+        exactly this level, so the next tick almost always trades through it).
+
+        Wait up to LIMIT_ENTRY_TIMEOUT seconds for fill, then:
+          → still open after half-timeout  : chase with new limit at mid-price
+          → still open after full-timeout  : cancel, fall back to market order
+        """
+        loop     = asyncio.get_event_loop()
+        sym      = config.SYMBOL_CCXT
+        side_in  = "buy" if signal.side == "LONG" else "sell"
+        limit_px = self._round_price(signal.entry)
+
+        await self._set_leverage_safe(sym)
+
+        # ── Place limit order ─────────────────────────────────────────────────
+        order_id = None
+        try:
+            order = await loop.run_in_executor(
+                None,
+                lambda: self._exchange.create_order(
+                    sym, "limit", side_in, qty, limit_px,
+                    params={"timeInForce": "GTC"},
+                ),
+            )
+            order_id = order.get("id")
+            logger.info(
+                f"[LIVE] Limit {signal.side} {qty:.4f} @ {limit_px} posted "
+                f"(maker fee 0.02%)  id={order_id}"
+            )
+        except Exception as e:
+            logger.warning(f"[LIVE] Limit order failed: {e}  → market fallback")
+            return await self._place_market_entry(signal, qty)
+
+        # ── Poll for fill ─────────────────────────────────────────────────────
+        timeout    = config.LIMIT_ENTRY_TIMEOUT
+        deadline   = _time.monotonic() + timeout
+        half_point = _time.monotonic() + timeout / 2
+        chased     = False
+
+        while _time.monotonic() < deadline:
+            await asyncio.sleep(5)
+            try:
+                status = await loop.run_in_executor(
+                    None, lambda: self._exchange.fetch_order(order_id, sym)
+                )
+                s = status.get("status", "")
+                if s in ("closed", "filled"):
+                    filled_at = float(status.get("average") or limit_px)
+                    logger.info(
+                        f"[LIVE] Limit filled @ {filled_at:.2f}  "
+                        f"(saved {(0.0005 - 0.0002) * filled_at * qty:.4f} USDT in fees)"
+                    )
+                    return await self._place_sl_tp_orders(sym, signal, qty)
+                if s in ("canceled", "rejected", "expired"):
+                    logger.warning(f"[LIVE] Limit order {s} — market fallback")
+                    return await self._place_market_entry(signal, qty)
+            except Exception:
+                pass
+
+            # Chase: after half-timeout, move limit to current mark price
+            if not chased and _time.monotonic() >= half_point:
+                chased = True
+                try:
+                    await loop.run_in_executor(
+                        None, lambda: self._exchange.cancel_order(order_id, sym)
+                    )
+                    # Fetch current price and re-post slightly aggressively
+                    ticker = await loop.run_in_executor(
+                        None, lambda: self._exchange.fetch_ticker(sym)
+                    )
+                    mid = (float(ticker["bid"]) + float(ticker["ask"])) / 2
+                    chase_px = self._round_price(
+                        mid + 0.5 if side_in == "buy" else mid - 0.5  # 0.5 USDT inside book
+                    )
+                    new_order = await loop.run_in_executor(
+                        None,
+                        lambda: self._exchange.create_order(
+                            sym, "limit", side_in, qty, chase_px,
+                            params={"timeInForce": "GTC"},
+                        ),
+                    )
+                    order_id = new_order.get("id")
+                    logger.info(f"[LIVE] Limit chased to {chase_px}  id={order_id}")
+                except Exception as e:
+                    logger.warning(f"[LIVE] Chase failed: {e}  → market fallback")
+                    return await self._place_market_entry(signal, qty)
+
+        # ── Timeout: cancel and fall back to market ───────────────────────────
+        try:
+            await loop.run_in_executor(
+                None, lambda: self._exchange.cancel_order(order_id, sym)
+            )
+        except Exception:
+            pass
+        logger.info(f"[LIVE] Limit not filled in {timeout}s — market fallback")
+        return await self._place_market_entry(signal, qty)
+
     async def check_exit(self, current_price: float) -> Optional[Position]:
-        """Check SL/TP and trailing stop. Paper: simulate fills. Live: update SL order on trail."""
+        """
+        Check SL/TP and trailing stop.
+        Paper: simulate fills locally.
+        Live : poll exchange for remote fills (SL/TP hit on exchange), then trail.
+        """
         if self.position is None or self.position.closed:
             return None
         if config.PAPER_TRADING:
             return self._paper_check_exit(current_price)
-        # Live mode: exchange handles SL/TP fills; we only need to update SL on trail activation
+        # Live mode ─────────────────────────────────────────────────────────────
+        # 1. Sync with exchange: detect if SL/TP was already filled remotely.
+        #    This is the CRITICAL fix — without it the bot freezes after any
+        #    exchange-side fill (e.g. SL hit while WebSocket was lagging).
+        synced = await self._live_sync_position(current_price)
+        if synced:
+            return synced
+        # 2. If position is still open, update trailing stop on the exchange.
         await self._live_check_trail(current_price)
         return None
 
@@ -412,6 +633,19 @@ class Trader:
         return sl_changed
 
     def _paper_check_exit(self, price: float) -> Optional[Position]:
+        """Simulate SL / TP / trail exit in paper mode.
+
+        Applies the full trailing-stop logic, then checks whether ``price``
+        has crossed the SL or TP.  On a hit, closes the position, updates
+        the balance and consecutive-loss counter, and evaluates daily limits.
+
+        Args:
+            price: Current mark price to test against SL / TP levels.
+
+        Returns:
+            The closed :class:`Position` if an exit was triggered,
+            otherwise ``None``.
+        """
         pos = self.position
 
         self._apply_trail(pos, price)
@@ -436,18 +670,143 @@ class Trader:
             self.trade_log.append(pos)
             self.position = None
 
+            # Update consecutive-loss streak
+            if pos.close_reason == "SL":
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0   # TP or BE resets the streak
+
             logger.info(
                 f"[PAPER] {pos.close_reason}  PnL={pos.pnl:+.2f}  "
-                f"Balance={self.balance:.2f}  Day PnL={self.day_pnl:+.2f}"
+                f"Balance={self.balance:.2f}  Day PnL={self.day_pnl:+.2f}  "
+                f"consec_SL={self.consecutive_losses}"
             )
             self._check_daily_limits()
             return pos
         return None
 
-    async def _live_check_trail(self, price: float):
+    async def _live_sync_position(self, current_price: float) -> Optional[Position]:
         """
-        Apply full trail logic and, if SL changed, cancel-replace the exchange SL order.
-        Handles break-even, profit-lock, and dynamic trail — matches backtest exactly.
+        Poll the exchange to detect when an SL/TP order was filled remotely.
+
+        Why this is critical
+        ─────────────────────
+        Exchange SL/TP orders fill server-side. If the WebSocket drops for even a
+        few seconds around the fill time we never see the fill event, so
+        self.position stays non-None and the bot never opens another trade.
+
+        This method polls every LIVE_POSITION_SYNC_SECS seconds. When it finds
+        that the exchange position is gone it reconstructs the close from the
+        most recent trade fill, updates balance from the exchange, and returns
+        the closed Position so callers can log it and apply post-SL cooldown.
+        """
+        now = _time.monotonic()
+        if now - self._last_sync_time < config.LIVE_POSITION_SYNC_SECS:
+            return None
+        self._last_sync_time = now
+
+        if self.position is None or not self._exchange:
+            return None
+
+        loop = asyncio.get_event_loop()
+        try:
+            positions = await loop.run_in_executor(
+                None,
+                lambda: self._exchange.fetch_positions([config.SYMBOL_CCXT]),
+            )
+            exchange_qty = 0.0
+            for p in positions:
+                q = abs(float(p.get("contracts") or 0))
+                if q >= config.MIN_ORDER_QTY:
+                    exchange_qty = q
+                    break
+
+            if exchange_qty >= config.MIN_ORDER_QTY:
+                return None  # still open on exchange — nothing to do
+
+            # ── Position is gone: reconstruct the close ───────────────────────
+            pos = self.position
+            exit_price = current_price
+            close_reason = "SL"       # pessimistic default
+
+            # Try to find the actual fill price from recent trades
+            try:
+                my_trades = await loop.run_in_executor(
+                    None,
+                    lambda: self._exchange.fetch_my_trades(config.SYMBOL_CCXT, limit=5),
+                )
+                for t in reversed(my_trades):
+                    fill_px = float(t.get("price") or 0)
+                    if fill_px <= 0:
+                        continue
+                    exit_price = fill_px
+                    # Classify: TP is far from entry in winning direction; SL is opposite
+                    if pos.side == "LONG":
+                        if fill_px >= pos.tp * 0.995:
+                            close_reason = "TP"
+                        elif pos.trail_activated and fill_px > pos.entry * 0.999:
+                            close_reason = "BE"
+                        else:
+                            close_reason = "SL"
+                    else:
+                        if fill_px <= pos.tp * 1.005:
+                            close_reason = "TP"
+                        elif pos.trail_activated and fill_px < pos.entry * 1.001:
+                            close_reason = "BE"
+                        else:
+                            close_reason = "SL"
+                    break
+            except Exception:
+                # Fallback: infer from price relative to entry
+                if pos.side == "LONG":
+                    close_reason = "TP" if current_price > pos.entry else "SL"
+                else:
+                    close_reason = "TP" if current_price < pos.entry else "SL"
+                if pos.trail_activated and close_reason == "SL":
+                    close_reason = "BE"
+
+            # Refresh balance from exchange (reflects real fee-adjusted PnL)
+            try:
+                self.balance = await self.fetch_balance()
+                pos.pnl = self.balance - self.day_start_balance   # rough day-pnl proxy
+            except Exception:
+                mult = 1 if pos.side == "LONG" else -1
+                pos.pnl = (exit_price - pos.entry) * mult * pos.qty
+                self.balance += pos.pnl
+
+            pos.closed = True
+            pos.close_reason = close_reason
+            self.trade_log.append(pos)
+            self.position = None
+
+            # Update consecutive-loss streak
+            if close_reason == "SL":
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+
+            logger.info(
+                f"[LIVE SYNC] Exchange closed position [{close_reason}]  "
+                f"exit≈{exit_price:.2f}  balance={self.balance:.2f}  "
+                f"day_pnl={self.day_pnl:+.2f}  consec_SL={self.consecutive_losses}"
+            )
+            self._check_daily_limits()
+            return pos
+
+        except Exception as e:
+            logger.debug(f"[LIVE] Position sync poll error: {e}")
+            return None
+
+    async def _live_check_trail(self, price: float) -> None:
+        """Apply trailing-stop logic and update the exchange SL order if it changed.
+
+        Applies all three trail stages (break-even, profit-lock, dynamic trail)
+        via :meth:`_apply_trail`.  When the SL moves, the existing exchange
+        stop-market order is cancelled and a new one is placed at the updated
+        price.
+
+        Args:
+            price: Current mark price used to evaluate trail thresholds.
         """
         pos = self.position
         sl_before  = pos.sl
@@ -477,7 +836,16 @@ class Trader:
         except Exception as e:
             logger.error(f"[LIVE] Failed to update SL order on trail: {e}")
 
-    def stats(self) -> dict:
+    def stats(self) -> Dict:
+        """Return a summary statistics dictionary for the current session.
+
+        Returns:
+            Dictionary with keys:
+              ``trades``, ``wins``, ``tp_exits``, ``sl_exits``, ``be_exits``,
+              ``win_rate`` (%), ``total_pnl``, ``balance``, ``day_pnl``,
+              ``daily_halted``, ``days_profit_hit``, ``days_loss_hit``,
+              ``consecutive_losses``.
+        """
         tp_trades = [p for p in self.trade_log if p.close_reason == "TP"]
         sl_trades = [p for p in self.trade_log if p.close_reason == "SL"]
         be_trades = [p for p in self.trade_log if p.close_reason == "BE"]
@@ -497,4 +865,5 @@ class Trader:
             "daily_halted": self.daily_halted,
             "days_profit_hit": self.days_profit_hit,
             "days_loss_hit": self.days_loss_hit,
+            "consecutive_losses": self.consecutive_losses,
         }
