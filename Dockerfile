@@ -15,7 +15,7 @@
 #  gcc / libffi-dev are needed to compile C-extension wheels (numpy, aiohttp).
 #  They do NOT end up in the runtime image.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.11-slim AS builder
+FROM python:3.12.7-slim-bullseye AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
@@ -36,7 +36,7 @@ RUN pip install --upgrade pip \
 #  Stage 2 — runtime
 #  Clean base image + pre-built venv from stage 1 + application source only.
 # ─────────────────────────────────────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
+FROM python:3.12.7-slim-bullseye AS runtime
 
 # Runtime-only system packages:
 #   libffi8      — required by aiohttp / cffi at runtime

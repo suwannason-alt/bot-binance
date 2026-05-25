@@ -161,7 +161,33 @@ DAILY_LOSS_LIMIT_USD    = 50.0   # stop trading once daily PnL ≤ -$50 (fixed, 
 # 0 = use RISK_PERCENT (recommended: percentage scales with growing balance → better compounding)
 RISK_USD                = 0.0
 
+# ── Dynamic equity-percentage sizing  (NEW — highest priority) ───────────────
+# When EQUITY_PERCENT > 0 this mode overrides every other sizing method:
+#
+#   margin_usd       = current_equity × (EQUITY_PERCENT / 100)
+#   position_value   = margin_usd × LEVERAGE
+#   contract_qty     = position_value / entry_price
+#
+# "current_equity" is the live account's total equity at the moment of entry:
+#   live mode  → wallet_balance + unrealized_pnl  (fetched from Binance API)
+#   paper mode → self.balance  (compounded balance after each closed trade)
+#   backtest   → running balance on the equity curve at signal bar
+#
+# This mode compounds naturally: as the balance grows after winning trades,
+# the margin and position value grow proportionally.
+#
+# CALIBRATION (equity=$10k, entry=$50k, ATR_SL=1.5%, SL_mult=1.5×):
+#   EQUITY_PERCENT=10% → notional=$10k  (1.0× eff-lev)  ← conservative
+#   EQUITY_PERCENT=35% → notional=$35k  (3.5× eff-lev)  ← matches RISK_PERCENT=8% ✓
+#   EQUITY_PERCENT=40% → notional=$40k  (4.0× eff-lev)  ← slightly more aggressive
+#
+# DEFAULT: 35% — calibrated to produce the same effective leverage as the proven
+# RISK_PERCENT=8% / SL=1.5×ATR config ($1k→$42k, CAGR +112%/yr).
+# Set EQUITY_PERCENT=0 to fall back to SL-distance RISK_PERCENT mode.
+EQUITY_PERCENT = float(os.getenv("EQUITY_PERCENT", "35.0"))
+
 # ── Position-sizing priority (highest → lowest) ───────────────────────────────
+# 0. EQUITY_PERCENT > 0  →  qty = (equity × PCT% × LEVERAGE) / entry        ← NEW DEFAULT
 # 1. ORDER_BALANCE_USD > 0  →  qty = (ORDER_BALANCE_USD × LEVERAGE) / entry
 # 2. RISK_USD > 0           →  qty = RISK_USD / (entry × sl_dist),  cap @ LEVERAGE × balance / entry
 # 3. RISK_PERCENT           →  qty = (balance × RISK%) / (entry × sl_dist),  cap @ LEVERAGE × balance / entry

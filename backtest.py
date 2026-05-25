@@ -158,30 +158,46 @@ def _position_qty(
     atr_ratio: Optional[float] = None,
     size_scale: float = 1.0,
 ) -> float:
-    """Compute the contract quantity for a new position.
+    """Compute the contract quantity for a new simulated position.
+
+    Mirrors the live :func:`strategy.position_size_usdt` function exactly so
+    that backtest results are directly comparable to live trading performance.
 
     Sizing priority (highest → lowest):
 
-    1. ``ORDER_BALANCE_USD > 0``  →  fixed margin × leverage (ignores SL distance).
+    0. ``EQUITY_PERCENT > 0``  →  **dynamic equity-percentage** (default).
+       ``margin  = balance × EQUITY_PERCENT%``
+       ``notional = margin × LEVERAGE``
+       ``qty      = notional / entry``
+       Compounds naturally with the running equity curve.
+
+    1. ``ORDER_BALANCE_USD > 0``  →  fixed margin × leverage (no compounding).
     2. ``RISK_USD > 0``           →  fixed-dollar risk, capped by margin limit.
-    3. ``RISK_PERCENT``           →  % of balance risk, capped; optionally vol-adjusted.
+    3. ``RISK_PERCENT``           →  % of balance / SL distance, optionally vol-adjusted.
 
     Args:
-        balance:    Current account balance in quote currency.
-        entry:      Anticipated entry price.
+        balance:    Running equity at the time of the signal bar.
+        entry:      Anticipated fill price (after slippage).
         sl:         Stop-loss price.
-        atr_ratio:  Current ATR / 20-bar ATR SMA; used for volatility-adjusted sizing.
-        size_scale: Regime multiplier from the signal (e.g. 0.5 in HIGH_VOL regime).
+        atr_ratio:  Current ATR / 20-bar ATR SMA; used for volatility-adjusted sizing
+                    (mode 3 only).
+        size_scale: Combined regime + forecast multiplier applied to the final qty.
 
     Returns:
         Contract quantity (BTC for BTCUSDT), or 0.0 if sizing fails.
     """
-    # 1. Fixed order-balance sizing: notional = margin × leverage
+    # ── Mode 0: Dynamic equity-percentage ─────────────────────────────────────
+    if config.EQUITY_PERCENT > 0:
+        margin_usd     = balance * (config.EQUITY_PERCENT / 100.0)
+        notional       = margin_usd * max(config.LEVERAGE, 1)
+        return (notional / entry) * size_scale
+
+    # ── Mode 1: Fixed order-balance ────────────────────────────────────────────
     if config.ORDER_BALANCE_USD > 0:
         notional = config.ORDER_BALANCE_USD * max(config.LEVERAGE, 1)
         return (notional / entry) * size_scale
 
-    # 2 / 3. Risk-based sizing
+    # ── Modes 2 / 3: Risk-based sizing ────────────────────────────────────────
     if config.RISK_USD > 0:
         risk_dollar = config.RISK_USD
     else:
@@ -1010,23 +1026,29 @@ def run(
             continue
 
         # ══════════════════════════════════════════════════════════════════════
-        # STEP 4 — POSITION SIZING (VOL_SIZING_ENABLED)
+        # STEP 4 — POSITION SIZING
         # ──────────────────────────────────────────────────────────────────────
-        # _position_qty() applies two independent scaling layers:
+        # _position_qty() applies the active sizing mode then two scale layers:
         #
-        # Layer A — Volatility-adjusted risk (VOL_SIZING_ENABLED):
+        # Sizing mode (highest-priority first):
+        #   Mode 0 — EQUITY_PERCENT (default, 10%):
+        #     margin       = balance × 10%           (reads live equity curve)
+        #     position_val = margin × LEVERAGE        (= balance × 10% × 10 = 1× balance)
+        #     qty          = position_val / entry_price
+        #     → Compounds naturally: growing balance → larger notional each trade.
+        #
+        #   Mode 3 — RISK_PERCENT fallback (if EQUITY_PERCENT = 0):
+        #     risk_dollar  = balance × RISK_PERCENT / 100
+        #     qty          = risk_dollar / (entry × sl_distance)
+        #
+        # Layer A — Volatility-adjusted risk (VOL_SIZING_ENABLED, mode 3 only):
         #   Scales RISK_PERCENT inversely with ATR ratio (current ATR / 20-bar SMA).
-        #   ATR_ratio = 1.8 → scale = 0.56  (expanded vol → smaller position)
-        #   ATR_ratio = 0.7 → scale = 1.25  (compressed vol → larger, capped by max)
-        #   Keeps expected dollar-risk per trade constant across volatility regimes.
         #
         # Layer B — Regime size scale (ADAPTIVE_REGIME_ENABLED):
-        #   signal.size_scale = regime_state.size_scale from the RegimeState.
-        #   0.30 (choppy score=0) → 1.00 (strong trend score=1).
+        #   signal.size_scale from the RegimeState (0.30 → 1.00).
         #
         # Layer C — Forecast confidence scale (REGIME_FORECAST_ENABLED):
         #   strat_state.size_scale ∈ [0.5, 1.0] from the Markov forecaster.
-        #   Multiplies signal.size_scale; the combined result is capped by leverage.
         # ══════════════════════════════════════════════════════════════════════
         entry_price   = _apply_slippage(signal.entry, signal.side, is_entry=True)
         _signal_scale = signal.size_scale

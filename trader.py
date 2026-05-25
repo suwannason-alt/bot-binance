@@ -285,6 +285,46 @@ class Trader:
         data = await loop.run_in_executor(None, self._exchange.fetch_balance)
         return float(data["USDT"]["free"])
 
+    async def fetch_total_equity(self) -> float:
+        """Return the total USDT equity: wallet balance + unrealized PnL.
+
+        Used for ``EQUITY_PERCENT`` position sizing so the margin calculation
+        is based on the full account value, not just the free (idle) balance.
+
+        In paper mode the running ``self.balance`` already represents compounded
+        equity after each closed trade — unrealized PnL is always zero at entry
+        time because the bot holds at most one position and the guard in
+        ``open_position()`` rejects new signals while a position is open.
+
+        In live mode the Binance USDM Futures account supplies:
+          ``totalWalletBalance``   — sum of all margin + realized PnL
+          ``totalUnrealizedProfit`` — open position mark-to-market
+
+        Falls back to the free balance if the account info keys are absent
+        (e.g. unexpected CCXT response shape), so sizing degrades gracefully
+        rather than crashing.
+
+        Returns:
+            Total equity in USDT as a float.
+        """
+        if config.PAPER_TRADING:
+            return self.balance
+
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, self._exchange.fetch_balance)
+        info = data.get("info", {})
+        try:
+            wallet     = float(info["totalWalletBalance"])
+            unrealized = float(info.get("totalUnrealizedProfit", 0.0))
+            total_equity = wallet + unrealized
+            if total_equity > 0:
+                return total_equity
+        except (KeyError, TypeError, ValueError):
+            pass
+        # Graceful fallback: use reported USDT total, then free
+        usdt = data.get("USDT", {})
+        return float(usdt.get("total") or usdt.get("free") or self.balance)
+
     # ── Trade execution ───────────────────────────────────────────────────────
 
     async def open_position(self, signal: Signal) -> Optional[Position]:
@@ -301,9 +341,12 @@ class Trader:
             )
             return None
 
-        balance = await self.fetch_balance()
+        # Fetch total equity (wallet + unrealized PnL) for accurate EQUITY_PERCENT
+        # sizing.  Falls back to free balance gracefully in live mode; paper mode
+        # always returns self.balance directly.
+        equity  = await self.fetch_total_equity()
         raw_qty = position_size_usdt(
-            balance, signal.entry, signal.sl,
+            equity, signal.entry, signal.sl,
             atr_ratio=signal.indicators_1h.get("atr_ratio"),
             size_scale=signal.size_scale,
         )
@@ -312,16 +355,24 @@ class Trader:
         if qty < config.MIN_ORDER_QTY:
             logger.warning(
                 f"Computed qty {raw_qty:.6f} → rounded {qty:.6f} < MIN {config.MIN_ORDER_QTY} "
-                f"— skipping trade (balance too low or ATR too wide)"
+                f"— skipping trade (equity too low or ATR too wide)"
             )
             return None
 
-        risk_label = (
-            f"ORDER_BAL=${config.ORDER_BALANCE_USD:.0f}×{config.LEVERAGE}lev"
-            if config.ORDER_BALANCE_USD > 0
-            else (f"RISK_USD=${config.RISK_USD:.0f}" if config.RISK_USD > 0
-                  else f"RISK={config.RISK_PERCENT}%")
-        )
+        # ── Sizing mode label for the trade log ──────────────────────────────
+        if config.EQUITY_PERCENT > 0:
+            margin_usd   = equity * (config.EQUITY_PERCENT / 100.0)
+            position_val = margin_usd * config.LEVERAGE
+            risk_label   = (
+                f"EQ={config.EQUITY_PERCENT:.0f}%×{config.LEVERAGE}lev"
+                f"  margin=${margin_usd:.2f}  notional=${position_val:.2f}"
+            )
+        elif config.ORDER_BALANCE_USD > 0:
+            risk_label = f"ORDER_BAL=${config.ORDER_BALANCE_USD:.0f}×{config.LEVERAGE}lev"
+        elif config.RISK_USD > 0:
+            risk_label = f"RISK_USD=${config.RISK_USD:.0f}"
+        else:
+            risk_label = f"RISK={config.RISK_PERCENT}%"
         regime_str = getattr(signal, "regime", "?")
         logger.info(
             f"[{'PAPER' if config.PAPER_TRADING else 'LIVE'}] "

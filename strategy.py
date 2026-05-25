@@ -166,37 +166,51 @@ def position_size_usdt(
 
     Sizing priority (highest → lowest):
 
+    0. ``EQUITY_PERCENT > 0`` — **dynamic equity-percentage** (default mode).
+       ``margin = balance × EQUITY_PERCENT%``;
+       ``position_value = margin × LEVERAGE``;
+       ``qty = position_value / entry``.
+       Compounds naturally: larger balance → larger position each trade.
     1. ``ORDER_BALANCE_USD > 0`` — fixed margin × leverage; ignores SL distance.
     2. ``RISK_USD > 0``          — fixed-dollar risk, capped by leverage margin.
-    3. ``RISK_PERCENT``          — percentage of balance risk, optionally vol-adjusted.
+    3. ``RISK_PERCENT``          — percentage-of-balance risk divided by SL distance,
+       optionally vol-adjusted.
 
-    Volatility-adjusted sizing (when ``VOL_SIZING_ENABLED`` and ``atr_ratio`` given):
-    Scales ``risk_pct`` inversely with the ATR ratio so expected dollar-risk per
-    trade stays constant across low-vol and high-vol conditions. For example:
-
-      - ATR 1.8× normal → risk × 0.56  (expanded volatility → smaller position)
-      - ATR 0.6× normal → risk × 1.25  (compressed volatility → larger position)
+    Volatility-adjusted sizing (mode 3 only, when ``VOL_SIZING_ENABLED`` and
+    ``atr_ratio`` given): scales ``risk_pct`` inversely with the ATR ratio so
+    expected dollar-risk per trade stays constant across volatility regimes.
 
     Args:
-        balance:    Current account balance in USDT.
+        balance:    Current account total equity in USDT (wallet + unrealized PnL).
         entry:      Intended entry price.
         sl:         Stop-loss price.
         risk_pct:   Risk percentage override; uses ``RISK_PERCENT`` when ``None``.
         leverage:   Leverage cap override; uses ``LEVERAGE`` when ``None``.
         atr_ratio:  Current ATR divided by its 20-bar SMA; used for vol-adjusted sizing.
         size_scale: Additional multiplier applied after all other calculations
-            (``< 1.0`` reduces position in ``HIGH_VOL`` regime).
+            (``< 1.0`` reduces position in ``HIGH_VOL`` regime or choppy forecast).
 
     Returns:
         Un-rounded contract quantity as a float.  Callers must apply lot-step
         rounding before submitting an order.
     """
-    # 1. Fixed order-balance sizing — does not compound; use RISK_PERCENT for growth
+    lev = leverage if leverage is not None else config.LEVERAGE
+
+    # ── Mode 0: Dynamic equity-percentage (highest priority) ──────────────────
+    # margin_usd     = balance × (EQUITY_PERCENT / 100)
+    # position_value = margin_usd × LEVERAGE
+    # qty            = position_value / entry_price
+    if config.EQUITY_PERCENT > 0:
+        margin_usd     = balance * (config.EQUITY_PERCENT / 100.0)
+        position_value = margin_usd * max(lev, 1)
+        return (position_value / entry) * size_scale
+
+    # ── Mode 1: Fixed order-balance — does not compound with account growth ────
     if config.ORDER_BALANCE_USD > 0:
-        notional = config.ORDER_BALANCE_USD * max(config.LEVERAGE, 1)
+        notional = config.ORDER_BALANCE_USD * max(lev, 1)
         return (notional / entry) * size_scale
 
-    # 2 / 3. Risk-based sizing
+    # ── Modes 2 / 3: Risk-based sizing ────────────────────────────────────────
     if config.RISK_USD > 0:
         risk_dollar = config.RISK_USD
     else:
@@ -219,7 +233,6 @@ def position_size_usdt(
         return 0.0
     qty = risk_dollar / (entry * sl_dist)
 
-    lev = leverage if leverage is not None else config.LEVERAGE
     if lev > 0:
         qty = min(qty, balance * lev / entry)
     return qty
