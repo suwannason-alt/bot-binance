@@ -1,14 +1,27 @@
 """
 Binance Futures Trading Bot — entry point.
 
-Wires together the WebSocket client, strategy evaluator, and order executor
-into a single async event loop.  Three callbacks are registered:
+Wires together the WebSocket client, strategy evaluator, order executor,
+Walk-Forward Optimizer, and Markov regime forecaster into a single async
+event loop.
 
-  ``on_1h_close``  — fired on each closed 1H candle; runs the 1H breakout
-                     evaluator and opens a position when conditions are met.
-  ``on_5m_close``  — fired on each closed 5M candle (currently a no-op stub).
-  ``on_tick``      — fired on every mark-price update; checks SL/TP/trail
-                     exits and emits the periodic heartbeat log.
+Startup sequence
+----------------
+1. :class:`~state_manager.StateManager` checks for a recent saved state.
+2. If a fresh state (< 48 h) exists → :meth:`~warm_start.WarmStart.recover`
+   restores WFO + forecaster + strategy state in < 5 s.
+3. If stale / missing → :meth:`~warm_start.WarmStart.run` fetches ~3 000
+   historical 1H bars, runs a full dry-run hydration (< 1 s), then hands
+   over to the live loop.
+4. ``state.buf_1h`` is pre-seeded with the last 600 historical bars so that
+   indicators (EMA, RSI, ADX) are warm on the very first live candle.
+
+Three callbacks
+---------------
+``on_1h_close``  — evaluates the breakout signal, updates WFO / forecaster,
+                   persists state, opens a position when conditions are met.
+``on_5m_close``  — reserved for future 5M logic.
+``on_tick``      — mark-price SL/TP monitoring and heartbeat.
 
 Usage::
 
@@ -20,11 +33,17 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 import config
 import strategy
+from backtest import StrategyState
 from data_store import MarketState
+from regime_forecast import MarkovRegimeForecaster
+from state_manager import StateManager
 from trader import Trader
+from walk_forward_optimizer import WalkForwardOptimizer
+from warm_start import LiveHistory, WarmStart
 from ws_client import BinanceWS
 
 logging.basicConfig(
@@ -34,12 +53,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
-# ── State ──────────────────────────────────────────────────────────────────────
-state = MarketState()
+# ── Core live objects ──────────────────────────────────────────────────────────
+state  = MarketState()
 trader = Trader()
+sm     = StateManager()
 
+# ── Warm-start / autonomous strategy objects (populated before ws.run()) ───────
+_wfo:          Optional[WalkForwardOptimizer]   = None
+_forecaster:   Optional[MarkovRegimeForecaster] = None
+_strat_state:  StrategyState                    = StrategyState()
+_live_history: Optional[LiveHistory]            = None
+
+# ── Session counters ───────────────────────────────────────────────────────────
 _bars_since_last_1h: int = 9999   # 1H bars since last trade (for cooldown)
-_last_heartbeat: float   = 0.0    # monotonic time of last heartbeat log
+_last_heartbeat:   float = 0.0    # monotonic time of last heartbeat log
+_bar_counter:        int = 0      # absolute 1H bar count since warm-start epoch
+
+# ── State persistence cadence ─────────────────────────────────────────────────
+_STATE_SAVE_INTERVAL = 6   # save to SQLite every N 1H bars (≈ every 6 h)
 
 
 # ── Callbacks ──────────────────────────────────────────────────────────────────
@@ -47,19 +78,103 @@ _last_heartbeat: float   = 0.0    # monotonic time of last heartbeat log
 async def on_1h_close(mstate: MarketState) -> None:
     """Evaluate the 1H breakout strategy on each closed 1H candle.
 
-    Applies all pre-entry guards (daily limits, session window, consecutive-loss
-    circuit breaker, funding rate) before calling the strategy evaluator.
-    Opens a position when a valid signal is found.
+    Execution order on each 1H close:
+
+    1. **LiveHistory append** — push the closed candle into the sliding window
+       so the WFO training arrays stay current.
+    2. **Forecaster update** — classify the new bar's regime, update the Markov
+       transition matrix, derive entry gate and size scale for this bar.
+    3. **WFO retune** — if ``WFO_RETUNE_INTERVAL`` bars have elapsed since the
+       last retune, run the mini-backtest sweep and update ``_strat_state.active_bp``.
+    4. **Pre-entry guards** — daily limits, session window, consecutive-loss
+       circuit breaker, funding rate.
+    5. **Signal evaluation** — calls ``strategy.evaluate_1h_live`` with the
+       hydrated ``MarketState``.
+    6. **State persistence** — saves WFO / forecaster / position state to SQLite
+       every ``_STATE_SAVE_INTERVAL`` 1H bars.
 
     Args:
         mstate: Current :class:`~data_store.MarketState` with updated buffers.
     """
-    global _bars_since_last_1h
+    global _bars_since_last_1h, _bar_counter
+    global _wfo, _forecaster, _strat_state, _live_history
 
     # Daily reset (idempotent — safe to call here and in on_tick)
     trader.reset_day()
 
     _bars_since_last_1h += 1
+    _bar_counter         += 1
+
+    # ── 1. Append the just-closed candle to LiveHistory ───────────────────────
+    if _live_history is not None and mstate.buf_1h.count > 0:
+        # Pull the last bar from the buffer arrays
+        _, h1_live, l1_live, c1_live, v1_live = mstate.buf_1h.arrays()
+        o1_live, _, _, _, _ = mstate.buf_1h.arrays()
+        if len(c1_live) > 0:
+            _live_history.append_candle(
+                open_  = float(o1_live[-1]),
+                high   = float(h1_live[-1]),
+                low    = float(l1_live[-1]),
+                close  = float(c1_live[-1]),
+                volume = float(v1_live[-1]),
+            )
+
+    # ── 2. Forecaster update (REGIME_FORECAST_ENABLED) ───────────────────────
+    if config.REGIME_FORECAST_ENABLED and _forecaster is not None and _live_history is not None:
+        import indicators as _ind
+        from adaptive_regime import hurst_exponent as _hurst
+        _, h1_fc, l1_fc, c1_fc, _, adx_fc, atr_fc = _live_history.get_indicator_arrays()
+        if len(c1_fc) > 0 and not (
+            __import__("math").isnan(adx_fc[-1]) or __import__("math").isnan(atr_fc[-1])
+        ):
+            _adx_val  = float(adx_fc[-1])
+            _atr_pct  = float(atr_fc[-1]) / float(c1_fc[-1]) * 100 if c1_fc[-1] > 0 else 1.0
+            _hurst_v  = _hurst(c1_fc)
+            _new_state = _forecaster.classify(_adx_val, _atr_pct, _hurst_v)
+            _forecaster.update(_new_state)
+            _fc = _forecaster.forecast()
+
+            _strat_state.current_regime = _new_state
+            _strat_state.trend_prob     = _fc.trend_prob
+            _strat_state.choppy_prob    = _fc.choppy_prob
+
+            if _fc.choppy_prob >= config.FORECAST_CHOPPY_THRESHOLD:
+                _strat_state.entry_allowed      = False
+                _strat_state.effective_cooldown = config.WFO_CHOPPY_COOLDOWN
+                _strat_state.size_scale         = 0.5
+                logger.debug(
+                    "Forecast: CHOPPY imminent (%.0f%%) — entry blocked",
+                    _fc.choppy_prob * 100,
+                )
+            else:
+                _strat_state.entry_allowed      = True
+                _strat_state.effective_cooldown = config.TRADE_COOLDOWN_1H
+                _strat_state.size_scale         = min(1.0, 0.5 + _fc.trend_prob)
+
+    # ── 3. WFO retune (WFO_ENABLED) ──────────────────────────────────────────
+    if config.WFO_ENABLED and _wfo is not None and _live_history is not None:
+        _, h1_w, l1_w, c1_w, _, adx_w, atr_w = _live_history.get_indicator_arrays()
+        wfo_bar_idx = _live_history.bar_count  # relative index within LiveHistory
+        if _wfo.should_retune(wfo_bar_idx):
+            wfo_params = _wfo.optimize(
+                c1=c1_w, h1=h1_w, l1=l1_w,
+                adx_arr=adx_w, atr_arr=atr_w,
+                end_bar=wfo_bar_idx,
+            )
+            _strat_state.active_bp = wfo_params.breakout_period
+            pf_str = f"{wfo_params.profit_factor:.2f}" if wfo_params.profit_factor < 99 else "∞"
+            logger.info(
+                "WFO retune: BP=%d  PF=%s  n=%d  (bar=%d)",
+                wfo_params.breakout_period, pf_str,
+                wfo_params.n_trades, wfo_bar_idx,
+            )
+            # Append to structured WFO log table
+            sm.append_wfo_log(
+                bar=_bar_counter,
+                bp=wfo_params.breakout_period,
+                pf=wfo_params.profit_factor,
+                n=wfo_params.n_trades,
+            )
 
     if trader.daily_halted:
         logger.info(
@@ -68,16 +183,25 @@ async def on_1h_close(mstate: MarketState) -> None:
         )
         return
 
-    # ── Session time filter ───────────────────────────────────────────────────
-    # Only open positions within configured UTC hours (0,0 = 24/7).
+    # ── 4a. Forecast entry gate ───────────────────────────────────────────────
+    if config.REGIME_FORECAST_ENABLED and not _strat_state.entry_allowed:
+        logger.debug(
+            "Forecast entry blocked (choppy=%.0f%%)  bars_since=%d",
+            _strat_state.choppy_prob * 100, _bars_since_last_1h,
+        )
+        # Still persist state even on blocked bars
+        _maybe_save_state()
+        return
+
+    # ── 4b. Session time filter ───────────────────────────────────────────────
     s_start = config.SESSION_FILTER_START_UTC
     s_end   = config.SESSION_FILTER_END_UTC
     if s_start != 0 or s_end != 0:
         hour = datetime.now(timezone.utc).hour
         if s_start < s_end:
-            in_session = s_start <= hour < s_end      # e.g. 7-22: normal window
+            in_session = s_start <= hour < s_end
         else:
-            in_session = hour >= s_start or hour < s_end  # e.g. 22-6: wraps midnight
+            in_session = hour >= s_start or hour < s_end
         if not in_session:
             logger.debug(
                 f"1H close UTC {hour:02d}h — outside session window "
@@ -85,9 +209,7 @@ async def on_1h_close(mstate: MarketState) -> None:
             )
             return
 
-    # ── Consecutive-loss circuit breaker ──────────────────────────────────────
-    # Halt new entries today if MAX_CONSECUTIVE_LOSSES SLs in a row.
-    # (open_position also checks, but logging here gives a clear 1H-bar message.)
+    # ── 4c. Consecutive-loss circuit breaker ──────────────────────────────────
     if config.MAX_CONSECUTIVE_LOSSES > 0:
         cl = trader.consecutive_losses
         if cl >= config.MAX_CONSECUTIVE_LOSSES:
@@ -97,8 +219,7 @@ async def on_1h_close(mstate: MarketState) -> None:
             )
             return
 
-    # ── Funding rate gate ─────────────────────────────────────────────────────
-    # Binance settles funding every 8 h. Extreme rates erode profit quickly.
+    # ── 4d. Funding rate gate ─────────────────────────────────────────────────
     if config.FUNDING_RATE_MAX > 0:
         fr = abs(mstate.funding_rate)
         if fr > config.FUNDING_RATE_MAX:
@@ -108,12 +229,27 @@ async def on_1h_close(mstate: MarketState) -> None:
             )
             return
 
+    # ── 5. Signal evaluation ──────────────────────────────────────────────────
+    # Inject WFO breakout period override into config so evaluate_1h_live()
+    # uses the WFO-selected rolling window.
+    if config.WFO_ENABLED:
+        config.BREAKOUT_PERIOD = _strat_state.active_bp
+
     sig = strategy.evaluate_1h_live(mstate, _bars_since_last_1h)
     if sig:
+        # Apply forecast size scale on top of regime scale from the signal
+        if config.REGIME_FORECAST_ENABLED:
+            import numpy as np
+            sig.size_scale = float(
+                np.clip(sig.size_scale * _strat_state.size_scale, 0.10, 2.0)
+            )
+
         logger.info(f"SIGNAL  {sig.reason}")
         logger.info(
             f"  Entry={sig.entry:.2f}  SL={sig.sl:.2f} ({sig.sl_pct:.2f}%)  "
             f"TP={sig.tp:.2f} ({sig.tp_pct:.2f}%)  RR={sig.rr_ratio:.2f}  "
+            f"BP={_strat_state.active_bp}bars  "
+            f"size_scale={sig.size_scale:.0%}  "
             f"funding={mstate.funding_rate:.4%}"
         )
         pos = await trader.open_position(sig)
@@ -127,9 +263,43 @@ async def on_1h_close(mstate: MarketState) -> None:
         logger.debug(
             f"No 1H signal  buf={mstate.buf_1h.count}  mark={mstate.mark_price:.2f}  "
             f"funding={mstate.funding_rate:.4%}  day_pnl={trader.day_pnl:+.2f}  "
-            f"bars_since={_bars_since_last_1h}"
+            f"bars_since={_bars_since_last_1h}  BP={_strat_state.active_bp}"
         )
 
+    # ── 6. State persistence ──────────────────────────────────────────────────
+    _maybe_save_state()
+
+
+# ---------------------------------------------------------------------------
+# State persistence helper
+# ---------------------------------------------------------------------------
+
+def _maybe_save_state() -> None:
+    """Persist bot state to SQLite every ``_STATE_SAVE_INTERVAL`` 1H bars.
+
+    Safe to call on every bar — exits cheaply when the interval has not
+    elapsed.  Catches all exceptions so a DB write failure never halts the
+    live loop.
+    """
+    if _bar_counter % _STATE_SAVE_INTERVAL != 0:
+        return
+    try:
+        sm.save(
+            wfo          = _wfo,
+            forecaster   = _forecaster,
+            strat_state  = _strat_state,
+            bars_since_last = _bars_since_last_1h,
+            position     = trader.position,
+            balance      = trader.balance,
+            bar_counter  = _bar_counter,
+        )
+    except Exception as exc:
+        logger.warning("State save failed (non-fatal): %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Callbacks (continued)
+# ---------------------------------------------------------------------------
 
 async def on_5m_close(mstate: MarketState) -> None:
     """Handle a closed 5M candle event (stub — reserved for future use).
@@ -267,11 +437,80 @@ async def main() -> None:
 
     await trader.initialize()
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # WARM START — hydrate WFO + forecaster before going live
+    # ══════════════════════════════════════════════════════════════════════════
+    #
+    # Decision tree:
+    #   1. Load saved state from SQLite (StateManager).
+    #   2. If fresh (< 48 h): recover WFO + forecaster from snapshot +
+    #      fetch last N bars to refresh LiveHistory.  No full dry run needed.
+    #   3. If stale / absent: full warm start — fetch ~3 000 bars, run dry-run
+    #      hydration, write state snapshot for next restart.
+    #   4. Hydrate MarketState.buf_1h with the last MAX_CANDLES historical bars
+    #      so ``evaluate_1h_live()`` has warm indicators on the first tick.
+    # ══════════════════════════════════════════════════════════════════════════
+    global _wfo, _forecaster, _strat_state, _live_history
+    global _bars_since_last_1h, _bar_counter
+
+    saved_state = sm.load()
+
+    if saved_state is not None:
+        # ── Crash recovery path ───────────────────────────────────────────────
+        logger.info("Restoring from saved state (crash recovery / fast restart) …")
+        try:
+            warm = await WarmStart.recover(saved_state, symbol=config.SYMBOL)
+        except Exception as exc:
+            logger.error("Recovery failed: %s — falling back to fresh warm start", exc)
+            warm = await WarmStart.run(symbol=config.SYMBOL)
+    else:
+        # ── Fresh cold start ──────────────────────────────────────────────────
+        logger.info("No saved state — running full warm start …")
+        warm = await WarmStart.run(symbol=config.SYMBOL)
+
+    # Transfer hydrated components to module-level globals
+    _wfo             = warm.wfo
+    _forecaster      = warm.forecaster
+    _strat_state     = warm.strat_state
+    _live_history    = warm.live_history
+    _bars_since_last_1h = warm.bars_since_last
+    _bar_counter        = warm.bar_counter
+
+    # Seed MarketState.buf_1h with the last MAX_CANDLES historical bars
+    WarmStart.hydrate_candle_buffer(state.buf_1h, warm.live_history)
+
+    # Apply WFO-selected breakout period to config for evaluate_1h_live()
+    if config.WFO_ENABLED and _wfo is not None:
+        config.BREAKOUT_PERIOD = _strat_state.active_bp
+
+    # Persist initial state immediately (overwrites any stale entry)
+    sm.save(
+        wfo=_wfo, forecaster=_forecaster, strat_state=_strat_state,
+        bars_since_last=_bars_since_last_1h,
+        position=trader.position, balance=trader.balance,
+        bar_counter=_bar_counter,
+    )
+
+    WarmStart.print_summary(warm)
+    # ─────────────────────────────────────────────────────────────────────────
+
     try:
         await ws.run()
     except asyncio.CancelledError:
         pass
     finally:
+        # Final state save on clean shutdown
+        try:
+            sm.save(
+                wfo=_wfo, forecaster=_forecaster, strat_state=_strat_state,
+                bars_since_last=_bars_since_last_1h,
+                position=trader.position, balance=trader.balance,
+                bar_counter=_bar_counter,
+            )
+            logger.info("Final state saved to %s", sm.db_path())
+        except Exception as exc:
+            logger.warning("Final state save failed: %s", exc)
+
         stats = trader.stats()
         logger.info(
             f"Session ended  trades={stats['trades']}  win_rate={stats['win_rate']:.1f}%  "

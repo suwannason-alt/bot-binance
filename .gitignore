@@ -1,0 +1,50 @@
+# =============================================================================
+#  BTCUSDT Futures Bot — .gitignore
+# =============================================================================
+
+# ── Credentials & secrets (NEVER commit) ────────────────────────────────────
+.env
+*.env
+.env.*
+!.env.example        # keep the template
+
+# ── Bot runtime state ────────────────────────────────────────────────────────
+bot_state.db
+bot_state.db-wal
+bot_state.db-shm
+
+# ── Historical data cache (large; re-fetched on demand) ─────────────────────
+data/btcusdt_1h.csv
+data/btcusdt_5m.csv
+
+# ── Python bytecode ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Backtest outputs ─────────────────────────────────────────────────────────
+backtest_results/*.png
+backtest_results/*.txt
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+trading-bot.log
+nohup.out
+
+# ── IDE & editor ─────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo

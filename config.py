@@ -14,19 +14,73 @@ Key configuration sections:
   - Trailing stop cascade
   - Daily profit / loss limits
   - Live trading safety guards
+  - Telegram notifications
   - Quantitative enhancements (all ``OFF`` by default — enable via ``.env``)
+
+Production safety contract
+--------------------------
+When ``PAPER_TRADING=false`` the module performs a hard validation of all
+critical secrets at import time.  A missing API key raises ``EnvironmentError``
+immediately — the process exits before touching any exchange endpoint.
 """
 import os
+import sys
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ── Runtime environment ───────────────────────────────────────────────────────
+# Values: "production" | "staging" | "development"
+ENV = os.getenv("ENV", "production").lower()
 
 API_KEY    = os.getenv("BINANCE_API_KEY", "")
 API_SECRET = os.getenv("BINANCE_API_SECRET", "")
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 
+# ── Production safety guard ───────────────────────────────────────────────────
+# Hard-crash at import time if critical secrets are absent in live mode.
+# This prevents the bot from starting with empty credentials and silently
+# rejecting every order (or worse, being rejected mid-position).
+if not PAPER_TRADING:
+    _missing = [name for name, val in [
+        ("BINANCE_API_KEY",    API_KEY),
+        ("BINANCE_API_SECRET", API_SECRET),
+    ] if not val or val.startswith("PASTE_YOUR")]
+    if _missing:
+        print(
+            f"\n  ╔══ STARTUP ABORTED ═══════════════════════════════════════╗\n"
+            f"  ║  PAPER_TRADING=false but the following required            ║\n"
+            f"  ║  environment variables are missing or still set to their   ║\n"
+            f"  ║  placeholder values:                                       ║\n"
+            + "".join(
+                f"  ║    ✗  {k:<52}║\n" for k in _missing
+            ) +
+            f"  ║                                                            ║\n"
+            f"  ║  Fix:  edit .env → set real API credentials,               ║\n"
+            f"  ║        then restart the bot.                               ║\n"
+            f"  ╚════════════════════════════════════════════════════════════╝\n",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
 SYMBOL      = os.getenv("SYMBOL", "BTCUSDT")
 SYMBOL_CCXT = f"{SYMBOL[:3]}/{SYMBOL[3:]}"
+
+# ── Telegram notifications ────────────────────────────────────────────────────
+# Leave TELEGRAM_BOT_TOKEN empty to disable all Telegram alerts.
+# Alert level mirrors Python logging levels: DEBUG/INFO/WARNING/ERROR/CRITICAL.
+TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN",  "")
+TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID",    "")
+TELEGRAM_ALERT_LEVEL = os.getenv("TELEGRAM_ALERT_LEVEL", "INFO").upper()
+TELEGRAM_ENABLED     = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+# ── State persistence ─────────────────────────────────────────────────────────
+# Path to the SQLite database used by StateManager for crash recovery.
+# Relative paths are resolved from the directory that contains config.py.
+BOT_STATE_DB_PATH = os.getenv(
+    "BOT_STATE_DB_PATH",
+    os.path.join(os.path.dirname(__file__), "bot_state.db"),
+)
 
 WS_URL = (
     "wss://fstream.binance.com/stream?streams="
