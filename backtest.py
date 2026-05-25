@@ -18,7 +18,14 @@ import pandas as pd
 
 import config
 import indicators as ind
+from adaptive_regime import compute_adaptive_regime, hurst_exponent
+from regime_forecast import MarkovRegimeForecaster, RegimeForecast
 from strategy import Signal, evaluate_1h_signal, evaluate_from_indicators
+from walk_forward_optimizer import (
+    BREAKOUT_GRID,
+    ActiveParams,
+    WalkForwardOptimizer,
+)
 
 logger = logging.getLogger("backtest")
 
@@ -61,7 +68,35 @@ class BacktestResult:
     stats: dict
     df_5m: pd.DataFrame
     df_1h: pd.DataFrame
-    daily_pnl: pd.Series  # daily PnL as % of day-start balance
+    daily_pnl: pd.Series              # daily PnL as % of day-start balance
+    wfo_log: List[Dict] = field(default_factory=list)   # WFO retune history
+
+
+@dataclass
+class StrategyState:
+    """Live autonomous strategy state — updated each 1H bar.
+
+    Tracks the outputs of the Walk-Forward Optimizer and the Markov Regime
+    Forecaster so that the main loop can gate entries and adjust sizing
+    without modifying ``config`` at runtime.
+
+    Attributes:
+        active_bp:          Current breakout window (bars), selected by WFO.
+        current_regime:     Most recently classified regime (0=TREND, 1=CHOPPY, 2=QUIET).
+        trend_prob:         Forecast probability of the next bar being TREND.
+        choppy_prob:        Forecast probability of the next bar being CHOPPY.
+        entry_allowed:      ``False`` when the forecast blocks new entries.
+        size_scale:         Position-size multiplier from forecast confidence [0.5, 1.0].
+        effective_cooldown: Minimum bars between entries (may be extended by forecast).
+    """
+
+    active_bp:          int   = 14
+    current_regime:     int   = 0     # TREND
+    trend_prob:         float = 0.33
+    choppy_prob:        float = 0.33
+    entry_allowed:      bool  = True
+    size_scale:         float = 1.0
+    effective_cooldown: int   = 1
 
 
 @dataclass
@@ -197,26 +232,32 @@ def _build_rolling_extremes(
     return roll_high, roll_low
 
 
-def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
-    """Apply all three trailing-stop stages to an open position in-place.
+def _apply_classic_trail(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
+    """Apply the classic three-stage trailing cascade to an open position.
 
-    Stages (in order):
-        1. **Break-even** (``TRAIL_ACTIVATE_ATR``): move SL to entry when price
-           moves N×ATR in favour.
-        2. **Profit lock** (``TRAIL_LOCK_ATR``): advance SL to entry + 1×ATR
-           when price moves M×ATR in favour.
-        3. **Dynamic trail** (``TRAIL_STOP_ATR``): SL follows the running peak
-           at −N×ATR after break-even is activated.
+    This is the original exit logic extracted into its own function so that
+    :func:`_update_trailing_stop` can cleanly dispatch to either classic or
+    adaptive mode.
+
+    Stage 1 — **Break-even** (``TRAIL_ACTIVATE_ATR``):
+        Move SL to the entry price once price has moved ``N×ATR`` in favour.
+        Eliminates the risk of a profitable trade turning into a loss.
+
+    Stage 2 — **Profit lock** (``TRAIL_LOCK_ATR``):
+        Advance SL to ``entry + 1×ATR`` (a guaranteed +1R profit) once price
+        has moved ``M×ATR`` in favour.  Prevents a large winner from closing at
+        BE after a deep pullback.
+
+    Stage 3 — **Dynamic trail** (``TRAIL_STOP_ATR``):
+        After Stage 1 activates, SL tracks the running peak at a fixed
+        ``−N×ATR`` offset.  Lets the trade run in a trending market.
 
     Args:
-        position: The open position to modify.
-        bar_high: High of the current bar (used to update trail peak for LONG).
-        bar_low:  Low of the current bar (used for SHORT).
+        position: The open position to modify in-place.
+        bar_high: Current bar's high price.
+        bar_low:  Current bar's low price.
     """
-    atr = position.entry_atr
-    if atr <= 0:
-        return
-
+    atr   = position.entry_atr
     entry = position.entry_price
     price = bar_high if position.side == "LONG" else bar_low
 
@@ -229,7 +270,7 @@ def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: flo
                (position.side == "SHORT" and new_sl < position.sl):
                 position.sl = new_sl
             position.be_activated = True
-            position.trail_peak = price
+            position.trail_peak   = price
 
     if not position.be_activated:
         return
@@ -260,6 +301,120 @@ def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: flo
             trail_sl = position.trail_peak + config.TRAIL_STOP_ATR * atr
             if trail_sl < position.sl:
                 position.sl = trail_sl
+
+
+def _apply_adaptive_trail(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
+    """Apply a single tightening trailing funnel to an open position.
+
+    Replaces the three discrete classic stages with a continuous trail whose
+    ATR-distance shrinks linearly as price advances from entry toward the TP
+    target.  This turns every "break-even exit" into a profitable exit
+    capturing 70–95% of the TP move.
+
+    Mathematical model::
+
+        progress   = clamp((peak − entry) / (tp − entry),  0, 1)   # LONG
+        trail_dist = ATR_SL_MULTIPLIER × (1 − progress)
+                   + ADAPTIVE_TRAIL_MIN_ATR × progress
+                   # = linear lerp: wide at activation → tight near TP
+
+        SL_new = peak − trail_dist × ATR   (LONG; reverse signs for SHORT)
+
+    Activation gate:
+        The trail activates only after price moves ``TRAIL_ACTIVATE_ATR × ATR``
+        in favour (same threshold as the classic Stage 1 break-even).  Before
+        activation the original hard SL is untouched — this guards against
+        early whipsaw exits near the entry.
+
+    Example (LONG, entry = 100, ATR = 1, SL_MULT = 1.5, TP_MULT = 9, MIN = 0.35):
+
+        +-----------+-----------+----------+---------+-----------------+
+        | progress  | fav. ATRs | trail×   | SL ≈    | move protected  |
+        +-----------+-----------+----------+---------+-----------------+
+        | 0.00 (BE) |   1.5     | 1.50×    |  100.0  | 0 % (break-even)|
+        | 0.17      |   1.5     | 1.305×   |  100.2  | — just BE+       |
+        | 0.50      |   4.5     | 0.925×   |  103.6  | 40 %            |
+        | 0.85      |   7.65    | 0.523×   |  107.1  | 79 %            |
+        | 1.00      |   9.0     | 0.35×    |  108.7  | 96 %            |
+        +-----------+-----------+----------+---------+-----------------+
+
+    Args:
+        position: The open position to modify in-place.
+        bar_high: Current bar's high price.
+        bar_low:  Current bar's low price.
+    """
+    atr     = position.entry_atr
+    entry   = position.entry_price
+    tp      = position.tp
+    is_long = position.side == "LONG"
+    price   = bar_high if is_long else bar_low
+
+    # ── Activation gate — same threshold as TRAIL_ACTIVATE_ATR ───────────────
+    act_thr = config.TRAIL_ACTIVATE_ATR
+    if not position.be_activated:
+        # When act_thr == 0, activate immediately (no minimum profit requirement).
+        favour = (price - entry) if is_long else (entry - price)
+        if act_thr > 0 and favour < act_thr * atr:
+            return   # not yet in sufficient profit to begin trailing
+        position.be_activated = True
+        position.trail_peak   = price
+
+    # ── Update running peak ───────────────────────────────────────────────────
+    if is_long:
+        position.trail_peak = max(position.trail_peak, bar_high)
+    else:
+        position.trail_peak = (min(position.trail_peak, bar_low)
+                               if position.trail_peak > 0 else bar_low)
+
+    peak = position.trail_peak
+
+    # ── Progress toward TP  [0.0 = just activated … 1.0 = peak at TP] ────────
+    tp_dist     = abs(tp - entry)
+    favour_peak = (peak - entry) if is_long else (entry - peak)
+    progress    = float(np.clip(favour_peak / tp_dist if tp_dist > 0 else 0.0, 0.0, 1.0))
+
+    # ── Adaptive trail distance — linear interpolation ────────────────────────
+    #
+    #   max_trail = ATR_SL_MULTIPLIER   (original SL distance — widest point)
+    #   min_trail = ADAPTIVE_TRAIL_MIN_ATR (tightest, applied at TP level)
+    #
+    #   At progress = 0.0: trail = max_trail  (≈ BE — SL moves to entry)
+    #   At progress = 1.0: trail = min_trail  (very tight — captures ~96% of TP)
+    max_trail = config.ATR_SL_MULTIPLIER
+    min_trail = config.ADAPTIVE_TRAIL_MIN_ATR
+    trail_atr = max_trail + (min_trail - max_trail) * progress   # lerp
+
+    trail_price = (peak - trail_atr * atr if is_long else peak + trail_atr * atr)
+
+    # ── Ratchet — SL moves only in the favourable direction ───────────────────
+    if is_long and trail_price > position.sl:
+        position.sl = trail_price
+    elif not is_long and trail_price < position.sl:
+        position.sl = trail_price
+
+
+def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
+    """Dispatch trailing-stop logic to the correct implementation.
+
+    When ``ADAPTIVE_TRAILING_ENABLED`` is ``True``, delegates to
+    :func:`_apply_adaptive_trail`, which replaces all three classic stages with
+    a single continuous tightening funnel.
+
+    When ``ADAPTIVE_TRAILING_ENABLED`` is ``False`` (default), delegates to
+    :func:`_apply_classic_trail` (break-even → profit lock → dynamic trail).
+
+    Args:
+        position: The open position to modify in-place.
+        bar_high: Current bar's high price.
+        bar_low:  Current bar's low price.
+    """
+    if position.entry_atr <= 0:
+        return
+
+    if config.ADAPTIVE_TRAILING_ENABLED:
+        _apply_adaptive_trail(position, bar_high, bar_low)
+    else:
+        _apply_classic_trail(position, bar_high, bar_low)
 
 
 def _check_daily_limits(
@@ -358,6 +513,30 @@ def run(
 
     roll_high_1h, roll_low_1h = _build_rolling_extremes(h1, l1, config.BREAKOUT_PERIOD)
 
+    # ── WFO: pre-compute rolling extremes for every grid breakout period ──────
+    # Indexed by breakout period so that _active_bp_ can be switched without
+    # recomputing (rolling is vectorised; no per-bar cost in the main loop).
+    roll_high_grid: Dict[int, np.ndarray] = {config.BREAKOUT_PERIOD: roll_high_1h}
+    roll_low_grid:  Dict[int, np.ndarray] = {config.BREAKOUT_PERIOD: roll_low_1h}
+    if config.WFO_ENABLED:
+        for _bp_g in BREAKOUT_GRID:
+            if _bp_g not in roll_high_grid:
+                roll_high_grid[_bp_g], roll_low_grid[_bp_g] = _build_rolling_extremes(
+                    h1, l1, _bp_g
+                )
+
+    # ── Autonomous strategy components ────────────────────────────────────────
+    wfo:        Optional[WalkForwardOptimizer]  = (
+        WalkForwardOptimizer() if config.WFO_ENABLED else None
+    )
+    forecaster: Optional[MarkovRegimeForecaster] = (
+        MarkovRegimeForecaster() if config.REGIME_FORECAST_ENABLED else None
+    )
+    strat_state: StrategyState = StrategyState(
+        active_bp          = config.BREAKOUT_PERIOD,
+        effective_cooldown = config.TRADE_COOLDOWN_1H,
+    )
+
     # Map each 5M bar to the index of the last closed 1H bar
     idx_1h = np.searchsorted(ct_1h, ct_5m, side="right") - 1
 
@@ -413,7 +592,21 @@ def run(
             daily_target_hit = False
             daily_profit_hit = False
 
-        # ── SL / TP check on the next bar's high/low ─────────────────────────
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 1 — EXIT MANAGEMENT (ADAPTIVE_TRAILING_ENABLED)
+        # ──────────────────────────────────────────────────────────────────────
+        # _update_trailing_stop() dispatches to one of two implementations:
+        #
+        #   ADAPTIVE_TRAILING_ENABLED = True  →  _apply_adaptive_trail()
+        #     Single tightening funnel: trail_dist shrinks from ATR_SL_MULTIPLIER
+        #     (at activation) → ADAPTIVE_TRAIL_MIN_ATR (at TP level).  Replaces
+        #     the discrete BE / lock / dynamic-trail cascade.
+        #
+        #   ADAPTIVE_TRAILING_ENABLED = False (default)  →  _apply_classic_trail()
+        #     Stage 1: move SL to entry (BE) after TRAIL_ACTIVATE_ATR × ATR gain.
+        #     Stage 2: advance SL to entry + 1×ATR at TRAIL_LOCK_ATR × ATR.
+        #     Stage 3: trail SL at -TRAIL_STOP_ATR × ATR from running peak.
+        # ══════════════════════════════════════════════════════════════════════
         if position is not None:
             _update_trailing_stop(position, bar_high=h5[i], bar_low=l5[i])
 
@@ -637,51 +830,212 @@ def run(
                 continue
 
             slope_bars = config.EMA_TREND_SLOPE_BARS
-            j_slope = j - slope_bars
+            j_slope    = j - slope_bars
             ema_t_prev = (
                 float(ema_trend_1h[j_slope])
                 if j_slope >= 0 and not np.isnan(ema_trend_1h[j_slope]) else None
             )
-            vol_ratio = (
+            vol_ratio  = (
                 float(v1[j] / vol_sma_1h[j])
                 if not np.isnan(vol_sma_1h[j]) and vol_sma_1h[j] > 0 else None
             )
-            atr_ratio = (
+            atr_ratio  = (
                 float(atr_1h[j] / atr_sma_1h[j])
                 if not np.isnan(atr_sma_1h[j]) and atr_sma_1h[j] > 0 else None
             )
-            adx_val = float(adx_1h[j]) if not np.isnan(adx_1h[j]) else None
+            adx_val    = float(adx_1h[j]) if not np.isnan(adx_1h[j]) else None
 
+            # ══════════════════════════════════════════════════════════════════
+            # STEP 1b — REGIME FORECAST UPDATE  (REGIME_FORECAST_ENABLED)
+            # ──────────────────────────────────────────────────────────────────
+            # Classify the current bar, update the Markov transition matrix,
+            # and derive entry gates + size scale from the one-step-ahead
+            # probability forecast.
+            #
+            # Gate logic:
+            #   choppy_prob ≥ FORECAST_CHOPPY_THRESHOLD → suppress entry,
+            #       extend cooldown to WFO_CHOPPY_COOLDOWN bars.
+            #   trend_prob  ≥ FORECAST_MIN_TREND_PROB   → allow entry,
+            #       scale size by clamp(trend_prob + 0.5, 0.5, 1.0).
+            #   confidence  < FORECAST_MIN_CONFIDENCE   → forecast unreliable,
+            #       keep full size regardless of probabilities.
+            # ══════════════════════════════════════════════════════════════════
+            if config.REGIME_FORECAST_ENABLED and forecaster is not None:
+                _adx_fc   = float(adx_val) if adx_val is not None else 20.0
+                _atr_pct_fc = (float(atr_1h[j]) / float(c1[j]) * 100
+                               if c1[j] > 0 else 1.0)
+                _hurst_fc = hurst_exponent(c1[: j + 1])
+                _new_state = forecaster.classify(_adx_fc, _atr_pct_fc, _hurst_fc)
+                forecaster.update(_new_state)
+                _fc: RegimeForecast = forecaster.forecast()
+
+                strat_state.current_regime = _new_state
+                strat_state.trend_prob     = _fc.trend_prob
+                strat_state.choppy_prob    = _fc.choppy_prob
+
+                if _fc.choppy_prob >= config.FORECAST_CHOPPY_THRESHOLD:
+                    # High probability of a choppy bar — block entry
+                    strat_state.entry_allowed      = False
+                    strat_state.effective_cooldown = config.WFO_CHOPPY_COOLDOWN
+                    strat_state.size_scale         = 0.5
+                else:
+                    strat_state.entry_allowed = True
+                    strat_state.effective_cooldown = config.TRADE_COOLDOWN_1H
+                    if (_fc.confidence >= config.FORECAST_MIN_CONFIDENCE
+                            and _fc.trend_prob >= config.FORECAST_MIN_TREND_PROB):
+                        # Confident TREND forecast → full/scaled-up size
+                        strat_state.size_scale = min(1.0, 0.5 + _fc.trend_prob)
+                    elif _fc.confidence >= config.FORECAST_MIN_CONFIDENCE:
+                        # Forecast exists but low trend probability → reduce size
+                        strat_state.size_scale = max(0.5, _fc.trend_prob)
+                    else:
+                        # Below confidence floor → forecast is noise, full size
+                        strat_state.size_scale = 1.0
+
+            # Forecast entry gate: skip this bar if choppy regime is imminent
+            if config.REGIME_FORECAST_ENABLED and not strat_state.entry_allowed:
+                continue
+
+            # Extended cooldown gate (must precede i1_dict build — bars_since_last
+            # is also passed to evaluate_1h_signal for its internal check)
+            if config.REGIME_FORECAST_ENABLED or config.WFO_ENABLED:
+                _eff_cd = max(strat_state.effective_cooldown, config.TRADE_COOLDOWN_1H)
+                if j - last_trade_1h_bar < _eff_cd:
+                    continue
+
+            # ══════════════════════════════════════════════════════════════════
+            # STEP 1c — WALK-FORWARD RETUNE  (WFO_ENABLED)
+            # ──────────────────────────────────────────────────────────────────
+            # Every WFO_RETUNE_INTERVAL bars, sweep BREAKOUT_GRID over the past
+            # WFO_TRAINING_WINDOW bars and pick the breakout period with the
+            # highest Profit Factor (subject to WFO_MIN_TRADES minimum).
+            # The selected period is used for rolling_max / rolling_min lookups
+            # for the next interval — no lookahead, applied to future bars only.
+            # ══════════════════════════════════════════════════════════════════
+            if config.WFO_ENABLED and wfo is not None and wfo.should_retune(j):
+                _wfo_params: ActiveParams = wfo.optimize(
+                    c1=c1, h1=h1, l1=l1,
+                    adx_arr=adx_1h, atr_arr=atr_1h,
+                    end_bar=j,
+                )
+                strat_state.active_bp = _wfo_params.breakout_period
+                logger.info(
+                    "WFO retune @ 1H bar %d: BP=%d  PF=%.2f  n_trades=%d",
+                    j, _wfo_params.breakout_period,
+                    _wfo_params.profit_factor, _wfo_params.n_trades,
+                )
+
+            # ── Select rolling extremes for the active breakout period ────────
+            _active_bp = strat_state.active_bp if config.WFO_ENABLED else config.BREAKOUT_PERIOD
+            _rh = roll_high_grid.get(_active_bp, roll_high_1h)
+            _rl = roll_low_grid.get(_active_bp, roll_low_1h)
+
+            # ══════════════════════════════════════════════════════════════════
+            # STEP 2 — REGIME CLASSIFICATION (REGIME_FILTER / ADAPTIVE_REGIME)
+            # ──────────────────────────────────────────────────────────────────
+            # The regime state is computed here and injected into i1_dict.
+            # evaluate_1h_signal() reads it to suppress / tighten entries.
+            #
+            # ADAPTIVE_REGIME_ENABLED = True  (recommended):
+            #   compute_adaptive_regime() builds a RegimeState with:
+            #     • score ∈ [0,1] from Hurst × ADX-momentum × BBW-percentile
+            #     • score < ADAPTIVE_MIN_SCORE  → entry fully suppressed
+            #     • entry_buffer_atr            → breakout filter tightens in chop
+            #     • effective_adx_min           → ADX floor relaxed in strong trend
+            #   All four outputs are smooth continuous functions — no cliff edges.
+            #
+            # ADAPTIVE_REGIME_ENABLED = False (classic):
+            #   REGIME_FILTER_ENABLED in strategy.py checks static ADX thresholds.
+            #   "RANGING" regime (detect_regime) suppresses entry entirely.
+            # ══════════════════════════════════════════════════════════════════
+            i1_dict = {
+                "ema_fast":       float(ema_fast_1h[j]),
+                "ema_slow":       float(ema_slow_1h[j]),
+                "ema_trend":      float(ema_trend_1h[j]),
+                "ema_trend_prev": ema_t_prev,
+                "rsi":            float(rsi_1h[j]),
+                "macd_hist":      float(hist_1h[j]),
+                "macd_hist_prev": float(hist_1h[j - 1]),
+                "atr":            float(atr_1h[j]),
+                "atr_ratio":      atr_ratio,
+                "adx":            adx_val,
+                "close":          float(c1[j]),
+                "open":           float(o1[j]),
+                "vol_ratio":      vol_ratio,
+                # Use WFO-selected rolling extremes (or static if WFO is off)
+                "rolling_max":    float(_rh[j]) if not np.isnan(_rh[j]) else None,
+                "rolling_min":    float(_rl[j]) if not np.isnan(_rl[j]) else None,
+            }
+
+            if config.ADAPTIVE_REGIME_ENABLED:
+                _atr_pct = float(atr_1h[j]) / float(c1[j]) * 100 if c1[j] > 0 else 1.0
+                i1_dict["regime_state"] = compute_adaptive_regime(
+                    closes        = c1[:j + 1],
+                    highs         = h1[:j + 1],
+                    lows          = l1[:j + 1],
+                    adx_arr       = adx_1h[:j + 1],
+                    atr_pct       = _atr_pct,
+                    tp_base       = config.ADAPTIVE_TP_BASE,
+                    tp_max_ext    = config.ADAPTIVE_TP_MAX_EXT,
+                    sl_base       = config.ATR_SL_MULTIPLIER,
+                    sl_max_widen  = config.ADAPTIVE_SL_MAX_WIDEN,
+                    size_min      = config.ADAPTIVE_SIZE_MIN,
+                    buffer_max    = config.ADAPTIVE_BUFFER_MAX,
+                    adx_min_base  = config.ADX_MIN,
+                    adx_min_relax = config.ADAPTIVE_ADX_RELAX,
+                )
+
+            # ══════════════════════════════════════════════════════════════════
+            # STEP 3 — SIGNAL EVALUATION (DYNAMIC_TP_ENABLED)
+            # ──────────────────────────────────────────────────────────────────
+            # evaluate_1h_signal() applies (in order):
+            #
+            # 1. Cooldown guard   — TRADE_COOLDOWN_1H bars between entries.
+            # 2. Regime gate      — regime_state.score < ADAPTIVE_MIN_SCORE → None
+            # 3. Flat/ATR guards  — EMA_1H_MIN_SEP, ATR_1H_PCT_MIN/MAX.
+            # 4. Volume filter    — VOL_RATIO_MIN (institutional participation).
+            # 5. ADX/slope filter — regime_state.effective_adx_min (adaptive) or
+            #                       ADX_MIN (classic).  EMA200 slope direction.
+            # 6. Breakout filter  — close > rolling_high + regime_state.entry_buffer_atr
+            #                       (adaptive) or BREAKOUT_ATR_BUFFER (classic).
+            # 7. TP / SL sizing   — regime_state.tp_mult / sl_mult (adaptive) or
+            #                       DYNAMIC_TP_ENABLED × dynamic_tp_mult (classic).
+            # ══════════════════════════════════════════════════════════════════
             signal = evaluate_1h_signal(
-                i1={
-                    "ema_fast":       float(ema_fast_1h[j]),
-                    "ema_slow":       float(ema_slow_1h[j]),
-                    "ema_trend":      float(ema_trend_1h[j]),
-                    "ema_trend_prev": ema_t_prev,
-                    "rsi":            float(rsi_1h[j]),
-                    "macd_hist":      float(hist_1h[j]),
-                    "macd_hist_prev": float(hist_1h[j - 1]),
-                    "atr":            float(atr_1h[j]),
-                    "atr_ratio":      atr_ratio,
-                    "adx":            adx_val,
-                    "close":          float(c1[j]),
-                    "open":           float(o1[j]),
-                    "vol_ratio":      vol_ratio,
-                    "rolling_max":    float(roll_high_1h[j]) if not np.isnan(roll_high_1h[j]) else None,
-                    "rolling_min":    float(roll_low_1h[j])  if not np.isnan(roll_low_1h[j])  else None,
-                },
+                i1=i1_dict,
                 bars_since_last=j - last_trade_1h_bar,
             )
 
         if signal is None:
             continue
 
-        # ── Open new position ─────────────────────────────────────────────────
-        entry_price = _apply_slippage(signal.entry, signal.side, is_entry=True)
+        # ══════════════════════════════════════════════════════════════════════
+        # STEP 4 — POSITION SIZING (VOL_SIZING_ENABLED)
+        # ──────────────────────────────────────────────────────────────────────
+        # _position_qty() applies two independent scaling layers:
+        #
+        # Layer A — Volatility-adjusted risk (VOL_SIZING_ENABLED):
+        #   Scales RISK_PERCENT inversely with ATR ratio (current ATR / 20-bar SMA).
+        #   ATR_ratio = 1.8 → scale = 0.56  (expanded vol → smaller position)
+        #   ATR_ratio = 0.7 → scale = 1.25  (compressed vol → larger, capped by max)
+        #   Keeps expected dollar-risk per trade constant across volatility regimes.
+        #
+        # Layer B — Regime size scale (ADAPTIVE_REGIME_ENABLED):
+        #   signal.size_scale = regime_state.size_scale from the RegimeState.
+        #   0.30 (choppy score=0) → 1.00 (strong trend score=1).
+        #
+        # Layer C — Forecast confidence scale (REGIME_FORECAST_ENABLED):
+        #   strat_state.size_scale ∈ [0.5, 1.0] from the Markov forecaster.
+        #   Multiplies signal.size_scale; the combined result is capped by leverage.
+        # ══════════════════════════════════════════════════════════════════════
+        entry_price   = _apply_slippage(signal.entry, signal.side, is_entry=True)
+        _signal_scale = signal.size_scale
+        if config.REGIME_FORECAST_ENABLED:
+            _signal_scale = float(np.clip(_signal_scale * strat_state.size_scale, 0.1, 2.0))
         qty = _position_qty(
             balance, entry_price, signal.sl,
             atr_ratio=signal.indicators_1h.get("atr_ratio"),
-            size_scale=signal.size_scale,
+            size_scale=_signal_scale,
         )
         if qty < config.MIN_ORDER_QTY:
             continue
@@ -753,9 +1107,23 @@ def run(
         trades, initial_balance, balance, equity_curve,
         days_target_hit, len(daily_records), days_profit_hit, days_loss_hit,
     )
+
+    # Collect WFO retune log for the caller (run_backtest.py report)
+    _wfo_log: List[Dict] = []
+    if config.WFO_ENABLED and wfo is not None:
+        for _entry in wfo.log:
+            _wfo_log.append({
+                "bar": _entry.bar,
+                "bp":  _entry.bp,
+                "pf":  _entry.pf,
+                "n":   _entry.n,
+                "scores": {k: v for k, v in _entry.scores.items()},
+            })
+
     return BacktestResult(
         trades=trades, equity_curve=equity_curve, stats=stats,
         df_5m=df_5m, df_1h=df_1h, daily_pnl=daily_pnl,
+        wfo_log=_wfo_log,
     )
 
 

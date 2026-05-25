@@ -27,6 +27,7 @@ import numpy as np
 
 import config
 import indicators as ind
+from adaptive_regime import RegimeState, compute_adaptive_regime
 from data_store import MarketState
 
 logger = logging.getLogger("strategy")
@@ -287,15 +288,33 @@ def evaluate_1h_signal(
 
     atr_pct = atr / close * 100
 
-    # ── 1. Market regime detection ────────────────────────────────────────────
-    regime = detect_regime(adx_val, atr_pct, atr_ratio)
+    # ── 1. Regime detection — adaptive (preferred) or classic fallback ───────
+    if config.ADAPTIVE_REGIME_ENABLED and "regime_state" in i1:
+        # ── Adaptive path ────────────────────────────────────────────────────
+        rs: RegimeState = i1["regime_state"]
+        regime     = rs.regime_class
+        size_scale = rs.size_scale
 
-    # Skip RANGING markets entirely when filter is active
-    if config.REGIME_FILTER_ENABLED and regime == "RANGING":
-        return None
+        # Hard skip: market is too noisy for any entry
+        if rs.score < config.ADAPTIVE_MIN_SCORE:
+            return None
 
-    # Position-size scale for HIGH_VOL regime
-    size_scale = config.HIGH_VOL_SIZE_SCALE if regime == "HIGH_VOL" else 1.0
+        # Adaptive trade parameters (override static config)
+        _tp_mult      = rs.tp_mult
+        _sl_mult      = rs.sl_mult
+        _entry_buffer = rs.entry_buffer_atr * atr   # in price units
+        _adx_min      = rs.effective_adx_min
+
+    else:
+        # ── Classic path — original behaviour, unchanged ─────────────────────
+        regime = detect_regime(adx_val, atr_pct, atr_ratio)
+        if config.REGIME_FILTER_ENABLED and regime == "RANGING":
+            return None
+        size_scale    = config.HIGH_VOL_SIZE_SCALE if regime == "HIGH_VOL" else 1.0
+        _tp_mult      = dynamic_tp_mult(regime)
+        _sl_mult      = config.ATR_SL_MULTIPLIER
+        _entry_buffer = atr * config.BREAKOUT_ATR_BUFFER
+        _adx_min      = config.ADX_MIN
 
     # ── 2. Flat-market / ATR-bounds guards ────────────────────────────────────
     sep = abs(ema_f - ema_s) / ema_s
@@ -309,14 +328,14 @@ def evaluate_1h_signal(
     if vol_ratio is not None and vol_ratio < config.VOL_RATIO_MIN:
         return None
 
-    # ── 4. ATR-ratio / ADX fallback (when regime filter is disabled) ──────────
-    # detect_regime already applies these rules when REGIME_FILTER_ENABLED; kept
-    # here for backward compat with configs that set ATR_RATIO_MIN / ADX_MIN
-    # without enabling the full regime filter.
+    # ── 4. ATR-ratio / ADX check ─────────────────────────────────────────────
+    # Classic path: detect_regime already applies these rules when
+    # REGIME_FILTER_ENABLED; kept here for backward compat.
+    # Adaptive path: _adx_min is the regime-score-adjusted floor.
     if not config.REGIME_FILTER_ENABLED:
         if config.ATR_RATIO_MIN > 0 and atr_ratio is not None and atr_ratio < config.ATR_RATIO_MIN:
             return None
-        if config.ADX_MIN > 0 and adx_val is not None and adx_val < config.ADX_MIN:
+        if _adx_min > 0 and adx_val is not None and adx_val < _adx_min:
             return None
 
     # ── 5. EMA200 slope filter ────────────────────────────────────────────────
@@ -338,7 +357,8 @@ def evaluate_1h_signal(
     macd_short_ok = hist is not None and h_prv is not None and hist < 0 and hist < h_prv
 
     # ── 8. Breakout buffer ────────────────────────────────────────────────────
-    bo_buf = atr * config.BREAKOUT_ATR_BUFFER
+    # Adaptive: shrinks toward 0 as regime_score → 1; classic: static config value.
+    bo_buf = _entry_buffer
 
     # ── 9. Directional signal conditions ─────────────────────────────────────
     long_ok = (
@@ -370,25 +390,29 @@ def evaluate_1h_signal(
             return None
 
     # ── Build signal ──────────────────────────────────────────────────────────
-    side    = "LONG" if long_ok else "SHORT"
-    entry   = close
-    tp_mult = dynamic_tp_mult(regime)
+    side  = "LONG" if long_ok else "SHORT"
+    entry = close
 
-    sl = (entry - atr * config.ATR_SL_MULTIPLIER if side == "LONG"
-          else entry + atr * config.ATR_SL_MULTIPLIER)
-    tp = (entry + atr * tp_mult if side == "LONG"
-          else entry - atr * tp_mult)
+    sl = (entry - _sl_mult * atr if side == "LONG"
+          else entry + _sl_mult * atr)
+    tp = (entry + _tp_mult * atr if side == "LONG"
+          else entry - _tp_mult * atr)
 
     sl_dist = abs(entry - sl)
     tp_dist = abs(tp - entry)
     rr      = round(tp_dist / sl_dist, 2) if sl_dist > 0 else 0
 
-    adx_str = f"{adx_val:.1f}" if adx_val is not None else "n/a"
-    bo_lvl  = rolling_max if side == "LONG" else rolling_min
-    reason  = (
+    adx_str   = f"{adx_val:.1f}" if adx_val is not None else "n/a"
+    bo_lvl    = rolling_max if side == "LONG" else rolling_min
+    score_str = (f"  score={i1['regime_state'].score:.2f}"
+                 f"  H={i1['regime_state'].hurst:.2f}"
+                 f"  bbw={i1['regime_state'].bbw_pct:.2f}"
+                 if config.ADAPTIVE_REGIME_ENABLED and "regime_state" in i1 else "")
+    reason    = (
         f"{side}|regime={regime}  ema200={'above' if close > ema_t else 'below'}  "
         f"sep={sep*100:.2f}%  rsi={rsi:.1f}  adx={adx_str}  "
-        f"bo={bo_lvl:.2f}  atr%={atr_pct:.2f}  tp_mult={tp_mult:.1f}  rr={rr}"
+        f"bo={bo_lvl:.2f}  atr%={atr_pct:.2f}  tp_mult={_tp_mult:.1f}  rr={rr}"
+        f"{score_str}"
     )
 
     return Signal(
@@ -587,7 +611,27 @@ def evaluate_1h_live(state: MarketState, bars_since_last: int = 9999) -> Optiona
         i1["rolling_min"] = None
 
     # ── ADX ───────────────────────────────────────────────────────────────────
-    adx_arr = ind.adx(h1, l1, c1, config.ADX_PERIOD)
+    adx_arr  = ind.adx(h1, l1, c1, config.ADX_PERIOD)
     i1["adx"] = ind.last(adx_arr)
+
+    # ── Adaptive regime (injected into i1 for evaluate_1h_signal) ─────────────
+    if config.ADAPTIVE_REGIME_ENABLED:
+        _atr_val = i1.get("atr") or 1.0
+        _cls_val = i1.get("close") or 1.0
+        i1["regime_state"] = compute_adaptive_regime(
+            closes        = c1,
+            highs         = h1,
+            lows          = l1,
+            adx_arr       = adx_arr,
+            atr_pct       = _atr_val / _cls_val * 100,
+            tp_base       = config.ADAPTIVE_TP_BASE,
+            tp_max_ext    = config.ADAPTIVE_TP_MAX_EXT,
+            sl_base       = config.ATR_SL_MULTIPLIER,
+            sl_max_widen  = config.ADAPTIVE_SL_MAX_WIDEN,
+            size_min      = config.ADAPTIVE_SIZE_MIN,
+            buffer_max    = config.ADAPTIVE_BUFFER_MAX,
+            adx_min_base  = config.ADX_MIN,
+            adx_min_relax = config.ADAPTIVE_ADX_RELAX,
+        )
 
     return evaluate_1h_signal(i1, bars_since_last)

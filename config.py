@@ -197,3 +197,133 @@ BODY_ATR_RATIO_MIN = float(os.getenv("BODY_ATR_RATIO_MIN", "0.0"))
 # Falls back to market if not filled within LIMIT_ENTRY_TIMEOUT seconds.
 USE_LIMIT_ENTRY     = os.getenv("USE_LIMIT_ENTRY", "false").lower() == "true"
 LIMIT_ENTRY_TIMEOUT = int(os.getenv("LIMIT_ENTRY_TIMEOUT", "45"))   # seconds before market fallback
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE REGIME FRAMEWORK  (OFF by default — enable via .env)
+# ══════════════════════════════════════════════════════════════════════════════
+# Replaces static threshold optimisation (94 PARAM_CANDIDATES) with a single
+# self-calibrating strategy driven by three orthogonal market signals:
+#   1. Hurst Exponent  — price serial correlation (trending vs mean-reverting)
+#   2. ADX Momentum    — trend strength + slope direction
+#   3. BBW Percentile  — where current volatility sits in its own history
+#
+# All four adaptive outputs (TP, SL, size, entry-buffer) are smooth continuous
+# functions of a composite regime_score ∈ [0.0, 1.0].  No cliff edges.
+# Setting ADAPTIVE_REGIME_ENABLED=false → identical to classic mode.
+
+ADAPTIVE_REGIME_ENABLED = os.getenv("ADAPTIVE_REGIME_ENABLED", "false").lower() == "true"
+
+# Minimum regime score to allow any entry.
+# Below this threshold the market is considered pure noise → skip entirely.
+# 0.25 blocks the noisiest ~25% of bars; 0.35 is more conservative.
+ADAPTIVE_MIN_SCORE = float(os.getenv("ADAPTIVE_MIN_SCORE", "0.25"))
+
+# ── TP range: tp_base (at score=0) → tp_base × tp_max_ext (at score=1) ──────
+# Example defaults: TP ranges from 4.0x (choppy) to 10.0x (strong trend).
+# This lets the strategy survive choppy periods (lower TP = more exits before
+# reversal) while fully capturing trend moves (higher TP = let winners run).
+ADAPTIVE_TP_BASE    = float(os.getenv("ADAPTIVE_TP_BASE",    "4.0"))   # min TP multiplier
+ADAPTIVE_TP_MAX_EXT = float(os.getenv("ADAPTIVE_TP_MAX_EXT", "2.5"))   # factor at score=1 → max 10x
+
+# ── SL range: sl_base (at score=1) → sl_base × sl_max_widen (at score=0) ──
+# In choppy markets the SL widens slightly to avoid whipsaws;
+# in strong trends it stays tight (ATR already reflects lower noise).
+ADAPTIVE_SL_MAX_WIDEN = float(os.getenv("ADAPTIVE_SL_MAX_WIDEN", "1.8"))  # factor at score=0
+
+# ── Position size floor ───────────────────────────────────────────────────────
+# Minimum position fraction when regime score is near 0.
+# 0.30 → 30% of normal size in the choppiest markets (still participates,
+# just with reduced exposure to avoid serial SL losses).
+ADAPTIVE_SIZE_MIN = float(os.getenv("ADAPTIVE_SIZE_MIN", "0.30"))
+
+# ── Entry buffer ─────────────────────────────────────────────────────────────
+# In choppy markets, require the close to exceed the rolling high by up to
+# ADAPTIVE_BUFFER_MAX × ATR before triggering a breakout entry.
+# At score=1 this collapses to 0 (any close above high is valid).
+# Range 0.3-0.6 ATR is typical; 0 disables the adaptive buffer entirely.
+ADAPTIVE_BUFFER_MAX = float(os.getenv("ADAPTIVE_BUFFER_MAX", "0.50"))
+
+# ── Adaptive ADX minimum ─────────────────────────────────────────────────────
+# At score=1 (Hurst + BBW confirm a strong trend), the ADX floor is relaxed
+# by ADAPTIVE_ADX_RELAX points — allowing entries when a trend is clearly
+# building even if ADX hasn't caught up yet (ADX lags by design).
+# Effective ADX_MIN at score=1 = ADX_MIN - ADAPTIVE_ADX_RELAX
+# Example: ADX_MIN=20, RELAX=8 → floor drops to 12 in confirmed strong trends.
+ADAPTIVE_ADX_RELAX = float(os.getenv("ADAPTIVE_ADX_RELAX", "8.0"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADAPTIVE TRAILING STOP  (OFF by default — enable via .env)
+# ══════════════════════════════════════════════════════════════════════════════
+# Replaces the discrete 3-stage cascade (BE → lock → dynamic trail) with a
+# single tightening funnel: trail distance shrinks continuously from the full
+# SL distance at activation down to ADAPTIVE_TRAIL_MIN_ATR as price approaches TP.
+#
+# Activation threshold: same as TRAIL_ACTIVATE_ATR (price must move N×ATR in
+# favour before the trail begins — prevents noise exits near entry).
+#
+# Mathematical model:
+#   progress   = (current_peak − entry) / (tp − entry)     ∈ [0, 1]
+#   trail_dist = ATR_SL_MULTIPLIER × (1 − progress)
+#              + ADAPTIVE_TRAIL_MIN_ATR × progress          (linear lerp)
+#   SL         = peak − trail_dist × ATR                   (LONG)
+#              = peak + trail_dist × ATR                    (SHORT)
+#
+# Concrete example (LONG, entry=100, ATR=1, SL=1.5×, TP=9×, min_trail=0.35):
+#   progress = 0.00 (just activated) → trail = 1.50×  → SL ≈ 100.0  (at BE)
+#   progress = 0.50 (halfway to TP ) → trail = 0.925× → SL ≈ 104.0  (75% of move locked)
+#   progress = 0.85 (85% to TP     ) → trail = 0.523× → SL ≈ 107.1  (85% locked)
+#   progress = 1.00 (at TP         ) → trail = 0.35×  → SL ≈ 108.7  (95% locked)
+#
+# Effect: 'BE' exits are replaced by positive exits that capture 70-95% of the
+# full TP potential, even when price reverses just short of the TP level.
+
+ADAPTIVE_TRAILING_ENABLED = os.getenv("ADAPTIVE_TRAILING_ENABLED", "false").lower() == "true"
+ADAPTIVE_TRAIL_MIN_ATR    = float(os.getenv("ADAPTIVE_TRAIL_MIN_ATR", "0.35"))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WALK-FORWARD OPTIMIZATION  (OFF by default — enable via .env or --wfo flag)
+# ══════════════════════════════════════════════════════════════════════════════
+# Eliminates the need to hand-tune BREAKOUT_PERIOD.  Every WFO_RETUNE_INTERVAL
+# bars the engine mini-backtests the previous WFO_TRAINING_WINDOW bars for each
+# period in BREAKOUT_GRID = [7, 10, 14, 21, 28] and applies the highest
+# Profit-Factor winner for the next interval.
+#
+# No lookahead bias: training ends at bar N-1; apply window starts at bar N.
+# No commission / slippage in mini-backtest — it is a *relative* score, not
+# a P&L forecast.
+#
+# Typical cadence (1H bars):
+#   WFO_TRAINING_WINDOW = 2160  →  90 calendar days of history
+#   WFO_RETUNE_INTERVAL  =  720  →  retune every 30 calendar days
+#   WFO_MIN_TRADES       =    4  →  discard BPs with < 4 trades in training
+
+WFO_ENABLED          = os.getenv("WFO_ENABLED", "false").lower() == "true"
+WFO_RETUNE_INTERVAL  = int(os.getenv("WFO_RETUNE_INTERVAL",  "720"))   # bars between retuning
+WFO_TRAINING_WINDOW  = int(os.getenv("WFO_TRAINING_WINDOW",  "2160"))  # bars of training history
+WFO_MIN_TRADES       = int(os.getenv("WFO_MIN_TRADES",       "4"))     # min trades required to accept BP
+WFO_CHOPPY_COOLDOWN  = int(os.getenv("WFO_CHOPPY_COOLDOWN",  "6"))     # extended cooldown (bars) when forecast is choppy
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKOV REGIME FORECAST  (OFF by default — enable via .env or --forecast flag)
+# ══════════════════════════════════════════════════════════════════════════════
+# Classifies each 1H bar as TREND / CHOPPY / QUIET using ADX, ATR%, and the
+# Hurst exponent.  Maintains a rolling 300-bar first-order Markov transition
+# matrix to forecast the *next* bar's regime probabilities.
+#
+# Entry gates applied when enabled:
+#   choppy_prob ≥ FORECAST_CHOPPY_THRESHOLD   → suppress entry, extend cooldown
+#   trend_prob  ≥ FORECAST_MIN_TREND_PROB     → allow entry, scale size up
+#   confidence  < FORECAST_MIN_CONFIDENCE     → ignore forecast, full size
+#
+# Parameters:
+#   FORECAST_CHOPPY_THRESHOLD  — choppy probability above which entries are blocked.
+#                                0.65 means "65% chance the next bar is choppy → skip".
+#   FORECAST_MIN_TREND_PROB    — trend probability below which size is scaled to 50%.
+#                                0.35 means "need ≥ 35% trend probability for full size".
+#   FORECAST_MIN_CONFIDENCE    — max-probability below which size scaling is ignored.
+#                                0.30 ≈ uniform prior; below this, the model says nothing.
+
+REGIME_FORECAST_ENABLED    = os.getenv("REGIME_FORECAST_ENABLED", "false").lower() == "true"
+FORECAST_CHOPPY_THRESHOLD  = float(os.getenv("FORECAST_CHOPPY_THRESHOLD", "0.65"))
+FORECAST_MIN_TREND_PROB    = float(os.getenv("FORECAST_MIN_TREND_PROB",   "0.35"))
+FORECAST_MIN_CONFIDENCE    = float(os.getenv("FORECAST_MIN_CONFIDENCE",   "0.30"))
