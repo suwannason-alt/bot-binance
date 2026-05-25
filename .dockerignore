@@ -1,0 +1,103 @@
+# =============================================================================
+#  .dockerignore — controls what is sent to the Docker build daemon.
+#
+#  Excluding these files has two effects:
+#    1. Smaller build context  → faster `docker build` uploads
+#    2. Secrets never baked in → .env and keys are injected at runtime only
+#
+#  The COPY *.py instruction in the Dockerfile copies only Python source;
+#  everything else must be explicitly listed below to stay out.
+# =============================================================================
+
+
+# ─── Secrets & credentials ──────────────────────────────────────────────────
+# NEVER include in the image. Passed at runtime via `env_file: .env`.
+.env
+*.env
+.env.*
+!.env.example
+
+
+# ─── Historical data cache ───────────────────────────────────────────────────
+# Large CSV files (btcusdt_1h.csv ~40 MB, btcusdt_5m.csv ~400 MB).
+# These live in the `market_data` named volume, not in the image.
+data/
+
+
+# ─── Runtime state database ──────────────────────────────────────────────────
+# SQLite files live in the `bot_state` named volume, not in the image.
+bot_state.db
+bot_state.db-shm
+bot_state.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+
+# ─── Backtest outputs ────────────────────────────────────────────────────────
+backtest_results/
+*.png
+*.jpg
+
+
+# ─── Python bytecode & caches ────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+
+# ─── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env/
+
+
+# ─── Version control ─────────────────────────────────────────────────────────
+.git/
+.gitignore
+.gitattributes
+
+
+# ─── IDE & editor artifacts ──────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+.AppleDouble
+Thumbs.db
+
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+nohup.out
+logs/
+
+
+# ─── Docker files themselves (no need inside the image) ──────────────────────
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+
+# ─── Documentation ───────────────────────────────────────────────────────────
+README.md
+CLAUDE.md
+*.md
+
+
+# ─── Test / CI artifacts ─────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/

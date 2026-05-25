@@ -1,0 +1,111 @@
+# =============================================================================
+#  BTCUSDT Futures Trading Bot — docker-compose.yml
+#
+#  Quick reference:
+#    Start (detached)   :  docker compose up -d
+#    Follow logs        :  docker compose logs -f
+#    Graceful stop      :  docker compose stop        (saves state before exit)
+#    Hard kill          :  docker compose kill
+#    Rebuild image      :  docker compose build --no-cache && docker compose up -d
+#    One-off shell      :  docker compose run --rm binance-bot bash (opens shell)
+#    Reset state DB     :  docker compose run --rm binance-bot \
+#                            python -c "from state_manager import StateManager; \
+#                                       StateManager('/app/state/bot_state.db').clear()"
+# =============================================================================
+
+services:
+
+  binance-bot:
+    # ── Build ─────────────────────────────────────────────────────────────────
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime           # use only the final slim stage
+    image: binance-bot:latest
+    container_name: binance-bot
+
+    # ── Restart policy ────────────────────────────────────────────────────────
+    # unless-stopped: auto-restart on crash or server reboot.
+    # Bot does NOT restart if stopped with `docker compose stop` (clean intent).
+    restart: unless-stopped
+
+    # ── Environment ───────────────────────────────────────────────────────────
+    # .env supplies: BINANCE_API_KEY, BINANCE_API_SECRET, TELEGRAM_*, RISK_PERCENT, …
+    # Inline `environment:` block adds/overrides container-specific values that
+    # should never come from the host .env file.
+    env_file:
+      - .env
+    environment:
+      # ── Timezone — must match Binance server (UTC) ──────────────────────────
+      TZ: UTC
+
+      # ── Redirect StateManager to the persisted volume ───────────────────────
+      # config.BOT_STATE_DB_PATH is read by main.py at import time.
+      # This path sits inside the `bot_state` named volume so the SQLite file
+      # survives image rebuilds, `docker compose down`, and container crashes.
+      BOT_STATE_DB_PATH: /app/state/bot_state.db
+
+      # ── WFO is ON by default; override here if needed ───────────────────────
+      # WFO_ENABLED: "false"   # uncomment to run classic static mode
+
+    # ── CLI flags (passed as CMD args after the ENTRYPOINT) ───────────────────
+    # Blank = default (WFO ON).  Uncomment one of the alternatives to override.
+    command: []
+    # command: ["--no-wfo"]           # classic fixed BREAKOUT_PERIOD=14
+    # command: ["--forecast"]         # WFO + Markov regime forecast
+
+    # ── Persistent volumes ────────────────────────────────────────────────────
+    volumes:
+      # Named volume — StateManager SQLite DB.
+      # Survives: container restarts, image upgrades, `docker compose down`.
+      # Destroyed only by: `docker compose down -v` (explicit volume removal).
+      - bot_state:/app/state
+
+      # Named volume — Historical OHLCV CSV cache (1H + 5M klines).
+      # Warm-start fetches ~3 030 bars (~126 days) on first run; this cache
+      # means subsequent restarts skip the 30–90 s REST API fetch entirely.
+      - market_data:/app/data
+
+    # ── Structured logging ────────────────────────────────────────────────────
+    # json-file driver: readable via `docker compose logs -f`
+    # max-size / max-file: cap total log storage at ~250 MB (5 × 50 MB files).
+    # Rotate automatically so a long-running bot never fills the VPS disk.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # ── Resource limits ───────────────────────────────────────────────────────
+    # Bot typically uses 80–150 MB RAM during WFO hydration (numpy arrays).
+    # 512 MB headroom is conservative; raise to 768M on a 1 GB VPS.
+    # Remove this block entirely if running on dedicated hardware.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+        reservations:
+          memory: 128M
+
+    # ── Graceful shutdown timeout ─────────────────────────────────────────────
+    # Docker sends SIGTERM, then waits stop_grace_period before SIGKILL.
+    # 30 s gives main.py time to: finish the current 1H bar handler, save
+    # state to SQLite, log the session summary, and exit cleanly.
+    stop_grace_period: 30s
+
+
+# =============================================================================
+#  Named Volumes — defined here so Docker manages their lifecycle separately
+#  from the container.  Data persists across all `docker compose up/down` calls
+#  unless you explicitly run `docker compose down -v`.
+# =============================================================================
+volumes:
+  bot_state:
+    driver: local
+    labels:
+      com.bot.description: "StateManager SQLite DB — active trade state, WFO log"
+
+  market_data:
+    driver: local
+    labels:
+      com.bot.description: "OHLCV CSV cache — skips REST re-fetch on restart"

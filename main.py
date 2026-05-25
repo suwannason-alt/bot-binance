@@ -25,8 +25,11 @@ Three callbacks
 
 Usage::
 
-    python main.py
+    python main.py              # WFO enabled by default (recommended)
+    python main.py --no-wfo    # classic fixed BREAKOUT_PERIOD=14
+    python main.py --forecast  # WFO + Markov regime forecast
 """
+import argparse
 import asyncio
 import logging
 import signal
@@ -56,7 +59,10 @@ logger = logging.getLogger("main")
 # ── Core live objects ──────────────────────────────────────────────────────────
 state  = MarketState()
 trader = Trader()
-sm     = StateManager()
+# Resolve DB path from config so BOT_STATE_DB_PATH env var is honoured.
+# In Docker this points to the named-volume mount (/app/state/bot_state.db)
+# so the file survives container rebuilds and restarts.
+sm     = StateManager(db_path=config.BOT_STATE_DB_PATH)
 
 # ── Warm-start / autonomous strategy objects (populated before ws.run()) ───────
 _wfo:          Optional[WalkForwardOptimizer]   = None
@@ -377,6 +383,77 @@ ws = BinanceWS(
 )
 
 
+# ---------------------------------------------------------------------------
+# CLI parsing  (applied before asyncio.run so WFO flag reaches WarmStart)
+# ---------------------------------------------------------------------------
+
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line flags for the live trading bot.
+
+    WFO is **ON by default**.  Use ``--no-wfo`` to run the classic fixed
+    ``BREAKOUT_PERIOD`` mode.  All flags are applied to the live ``config``
+    module before :func:`main` is entered, so :class:`~warm_start.WarmStart`
+    sees the correct ``WFO_ENABLED`` value during hydration.
+
+    Returns:
+        Parsed :class:`argparse.Namespace`.
+    """
+    parser = argparse.ArgumentParser(
+        description="BTCUSDT Futures live trading bot  [WFO ON by default]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "WFO is the default execution mode — use --no-wfo for classic static\n"
+            "BREAKOUT_PERIOD=14 mode.\n"
+            "\n"
+            "Examples:\n"
+            "  python main.py              # WFO enabled (default, recommended)\n"
+            "  python main.py --no-wfo    # classic fixed BREAKOUT_PERIOD=14\n"
+            "  python main.py --forecast  # WFO + Markov regime forecast\n"
+        ),
+    )
+    parser.add_argument(
+        "--wfo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Walk-Forward Optimization: auto-select BREAKOUT_PERIOD every 30 days "
+            "(default: ON). Use --no-wfo to run classic fixed BREAKOUT_PERIOD=14."
+        ),
+    )
+    parser.add_argument(
+        "--forecast",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable Markov regime forecast: suppress entries when next-bar choppy "
+            "probability exceeds 65%%. Scale position size by trend confidence."
+        ),
+    )
+    return parser.parse_args()
+
+
+def _apply_args_to_config(args: argparse.Namespace) -> None:
+    """Write parsed CLI flags into the live ``config`` module.
+
+    Must be called **before** ``asyncio.run(main())`` so that
+    :class:`~warm_start.WarmStart` reads the correct ``config.WFO_ENABLED``
+    value during the hydration phase and creates (or skips) the
+    :class:`~walk_forward_optimizer.WalkForwardOptimizer` accordingly.
+
+    Args:
+        args: Parsed namespace from :func:`_parse_args`.
+    """
+    config.WFO_ENABLED             = args.wfo
+    config.REGIME_FORECAST_ENABLED = args.forecast
+
+    if not args.wfo:
+        logger.warning(
+            "WFO disabled (--no-wfo): running classic mode with fixed "
+            "BREAKOUT_PERIOD=%d.  Omit --no-wfo to restore auto-tuning.",
+            config.BREAKOUT_PERIOD,
+        )
+
+
 async def main() -> None:
     """Bootstrap the trading bot and run the WebSocket event loop.
 
@@ -401,8 +478,29 @@ async def main() -> None:
         f"{config.SESSION_FILTER_START_UTC:02d}:00–{config.SESSION_FILTER_END_UTC:02d}:00 UTC"
         if (config.SESSION_FILTER_START_UTC or config.SESSION_FILTER_END_UTC) else "24/7"
     )
+    # ── Feature-flag summary ──────────────────────────────────────────────────
+    _feat: list = []
+    if config.WFO_ENABLED:
+        _feat.append(
+            f"WFO(retune={config.WFO_RETUNE_INTERVAL}bars/"
+            f"train={config.WFO_TRAINING_WINDOW}bars)"
+        )
+    if config.REGIME_FORECAST_ENABLED:
+        _feat.append(f"FORECAST(choppy≥{config.FORECAST_CHOPPY_THRESHOLD:.0%}→block)")
+    if config.ADAPTIVE_REGIME_ENABLED:
+        _feat.append("ADAPTIVE")
+    if config.ADAPTIVE_TRAILING_ENABLED:
+        _feat.append("ADAPT_TRAIL")
+    _feat_str = "  ".join(_feat) if _feat else "classic (WFO off)"
+
     logger.info(f"Starting trading bot [{mode}] symbol={config.SYMBOL}")
+    logger.info(f"Autonomous mode: {_feat_str}")
     logger.info(
+        f"Strategy: 1H breakout  {sizing_label}  Leverage={config.LEVERAGE}x  "
+        f"SL={config.ATR_SL_MULTIPLIER}×ATR  TP={config.ATR_TP_MULTIPLIER}×ATR  "
+        f"ADX≥{config.ADX_MIN}  BP={config.BREAKOUT_PERIOD}bars (WFO will override)  "
+        f"SLOPE≥{config.EMA_SLOPE_MIN_PCT}%"
+        if config.WFO_ENABLED else
         f"Strategy: 1H breakout  {sizing_label}  Leverage={config.LEVERAGE}x  "
         f"SL={config.ATR_SL_MULTIPLIER}×ATR  TP={config.ATR_TP_MULTIPLIER}×ATR  "
         f"ADX≥{config.ADX_MIN}  BP={config.BREAKOUT_PERIOD}bars  "
@@ -523,4 +621,9 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Parse CLI flags and apply to config BEFORE entering the async loop.
+    # This ensures WarmStart.hydrate() sees the correct WFO_ENABLED value
+    # and creates the WalkForwardOptimizer during the hydration phase.
+    _args = _parse_args()
+    _apply_args_to_config(_args)
     asyncio.run(main())

@@ -3,9 +3,10 @@ Autonomous backtest runner — single-shot execution.
 
 Instead of sweeping 100+ static PARAM_CANDIDATES, the strategy self-tunes:
 
-  - **Walk-Forward Optimizer (WFO)** — re-selects BREAKOUT_PERIOD every 30 days
-    (``--wfo``).  Trains on the past 90 days of 1H data, picks the period with
-    the highest Profit Factor, applies it to the next 30 days.  Zero lookahead.
+  - **Walk-Forward Optimizer (WFO)** — re-selects BREAKOUT_PERIOD every 30 days.
+    Trains on the past 90 days of 1H data, picks the period with the highest
+    Profit Factor, applies it to the next 30 days.  Zero lookahead.
+    **Enabled by default.**  Disable with ``--no-wfo`` for classic static mode.
 
   - **Markov Regime Forecast** — classifies each bar as TREND/CHOPPY/QUIET,
     suppresses entries when next-bar choppy probability exceeds 65%
@@ -17,12 +18,13 @@ Instead of sweeping 100+ static PARAM_CANDIDATES, the strategy self-tunes:
 
 Usage::
 
-    python run_backtest.py                        # 5-year, proven base config
-    python run_backtest.py --days 2190            # 6-year run
-    python run_backtest.py --wfo                  # enable walk-forward optimization
-    python run_backtest.py --forecast             # enable Markov regime forecast
-    python run_backtest.py --adaptive             # enable adaptive regime framework
-    python run_backtest.py --all                  # enable all autonomous features
+    python run_backtest.py                        # 5-year with WFO (default)
+    python run_backtest.py --no-wfo               # 5-year classic static mode
+    python run_backtest.py --days 2190            # 6-year run with WFO
+    python run_backtest.py --forecast             # WFO + Markov regime forecast
+    python run_backtest.py --adaptive             # WFO + adaptive regime framework
+    python run_backtest.py --all                  # all autonomous features
+    python run_backtest.py --no-wfo --forecast    # forecast-only, no WFO
     python run_backtest.py --min-cagr 30 --max-dd 60   # tighter goal criteria
 
 Goal (period-invariant — same threshold for 3yr, 5yr, 6yr)::
@@ -107,14 +109,14 @@ _BASE: Dict = {
     "DAILY_LOSS_LIMIT_PCT":    0.0,
     # Body quality filter (0 = off)
     "BODY_ATR_RATIO_MIN":      0.0,
-    # All quant flags OFF — enabled via CLI args below
-    "REGIME_FILTER_ENABLED":   False,
-    "DYNAMIC_TP_ENABLED":      False,
-    "VOL_SIZING_ENABLED":      False,
-    "ADAPTIVE_REGIME_ENABLED": False,
+    # WFO ON by default; all other quant flags off — toggled via CLI args below
+    "REGIME_FILTER_ENABLED":    False,
+    "DYNAMIC_TP_ENABLED":       False,
+    "VOL_SIZING_ENABLED":       False,
+    "ADAPTIVE_REGIME_ENABLED":  False,
     "ADAPTIVE_TRAILING_ENABLED": False,
-    "WFO_ENABLED":             False,
-    "REGIME_FORECAST_ENABLED": False,
+    "WFO_ENABLED":              True,   # ← DEFAULT ON; disable with --no-wfo
+    "REGIME_FORECAST_ENABLED":  False,
 }
 
 
@@ -444,14 +446,16 @@ def parse_args() -> argparse.Namespace:
     _frac_d = f"{GOAL_MIN_YEAR_FRAC:.2f}"
 
     parser = argparse.ArgumentParser(
-        description="Autonomous BTCUSDT backtest runner",
+        description="Autonomous BTCUSDT backtest runner  [WFO ON by default]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Autonomous features (add any combination):\n"
-            "  --wfo        Walk-forward BREAKOUT_PERIOD optimizer (re-tunes every 30 days)\n"
-            "  --forecast   Markov regime forecast (blocks entries when choppy is imminent)\n"
-            "  --adaptive   Adaptive regime framework (continuous TP/SL/size from score)\n"
-            "  --all        Enable all three features simultaneously\n"
+            "WFO is the default execution mode — use --no-wfo for classic static mode.\n"
+            "\n"
+            "Autonomous feature flags:\n"
+            "  --wfo / --no-wfo  Walk-forward BREAKOUT_PERIOD optimizer (default: ON)\n"
+            "  --forecast        Markov regime forecast (blocks entries when choppy)\n"
+            "  --adaptive        Adaptive regime framework (continuous TP/SL/size)\n"
+            "  --all             Enable forecast + adaptive + adaptive-trail (WFO already on)\n"
             "\n"
             "Goal sub-criteria (all three must pass simultaneously):\n"
             f"  CAGR  >= --min-cagr   (default: {_cagr_d} pct/yr)\n"
@@ -459,10 +463,11 @@ def parse_args() -> argparse.Namespace:
             f"  Years >= --year-frac  (default: {_frac_d}  →  all years profitable)\n"
             "\n"
             "Examples:\n"
-            "  python run_backtest.py                           # classic, 5-year\n"
-            "  python run_backtest.py --wfo --forecast          # WFO + forecast\n"
+            "  python run_backtest.py                           # 5-year with WFO (default)\n"
+            "  python run_backtest.py --no-wfo                  # classic static BREAKOUT_PERIOD=14\n"
+            "  python run_backtest.py --forecast                # WFO + Markov regime forecast\n"
             "  python run_backtest.py --all --days 2190         # full stack, 6-year\n"
-            "  python run_backtest.py --risk 10 --tp 7.0        # custom risk/TP\n"
+            "  python run_backtest.py --no-wfo --risk 10 --tp 7.0  # classic with custom params\n"
         ),
     )
 
@@ -491,8 +496,13 @@ def parse_args() -> argparse.Namespace:
 
     # ── Autonomous features ───────────────────────────────────────────────────
     parser.add_argument(
-        "--wfo", action="store_true", default=False,
-        help="Enable Walk-Forward Optimization for BREAKOUT_PERIOD.",
+        "--wfo",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Walk-Forward Optimization: auto-select BREAKOUT_PERIOD every 30 days "
+            "(default: ON). Use --no-wfo to run classic fixed BREAKOUT_PERIOD=14."
+        ),
     )
     parser.add_argument(
         "--forecast", action="store_true", default=False,
@@ -508,7 +518,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--all", dest="all_features", action="store_true", default=False,
-        help="Enable WFO + forecast + adaptive regime + adaptive trailing simultaneously.",
+        help=(
+            "Enable forecast + adaptive regime + adaptive trailing simultaneously. "
+            "WFO is already on by default; combine with --no-wfo to disable it."
+        ),
     )
 
     # ── Base config overrides ─────────────────────────────────────────────────
@@ -535,7 +548,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--breakout", type=int, default=None,
         metavar="BARS",
-        help="Breakout period in 1H bars (default: 14; superseded by --wfo).",
+        help="Breakout period in 1H bars (default: 14; ignored while WFO is active).",
     )
     parser.add_argument(
         "--trail-lock", type=float, default=None,

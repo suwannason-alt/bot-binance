@@ -335,7 +335,8 @@ ADAPTIVE_TRAILING_ENABLED = os.getenv("ADAPTIVE_TRAILING_ENABLED", "false").lowe
 ADAPTIVE_TRAIL_MIN_ATR    = float(os.getenv("ADAPTIVE_TRAIL_MIN_ATR", "0.35"))
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WALK-FORWARD OPTIMIZATION  (OFF by default — enable via .env or --wfo flag)
+# WALK-FORWARD OPTIMIZATION  (ON by default — disable via WFO_ENABLED=false
+#                             in .env or via --no-wfo CLI flag)
 # ══════════════════════════════════════════════════════════════════════════════
 # Eliminates the need to hand-tune BREAKOUT_PERIOD.  Every WFO_RETUNE_INTERVAL
 # bars the engine mini-backtests the previous WFO_TRAINING_WINDOW bars for each
@@ -351,7 +352,7 @@ ADAPTIVE_TRAIL_MIN_ATR    = float(os.getenv("ADAPTIVE_TRAIL_MIN_ATR", "0.35"))
 #   WFO_RETUNE_INTERVAL  =  720  →  retune every 30 calendar days
 #   WFO_MIN_TRADES       =    4  →  discard BPs with < 4 trades in training
 
-WFO_ENABLED          = os.getenv("WFO_ENABLED", "false").lower() == "true"
+WFO_ENABLED          = os.getenv("WFO_ENABLED", "true").lower() == "true"
 WFO_RETUNE_INTERVAL  = int(os.getenv("WFO_RETUNE_INTERVAL",  "720"))   # bars between retuning
 WFO_TRAINING_WINDOW  = int(os.getenv("WFO_TRAINING_WINDOW",  "2160"))  # bars of training history
 WFO_MIN_TRADES       = int(os.getenv("WFO_MIN_TRADES",       "4"))     # min trades required to accept BP
