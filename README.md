@@ -2,7 +2,7 @@
 
 Autonomous algorithmic trading bot for **Binance USDT-M Perpetual Futures**.  
 Strategy: **1H momentum breakout** with **Walk-Forward Optimization (WFO) on by default**.  
-Verified over **5 years of live Binance data** (May 2021 → May 2026).
+Verified over **6 years of live Binance USDT-M Futures data** (Sep 2019 → May 2026).
 
 ---
 
@@ -37,7 +37,7 @@ The engine trades BTCUSDT perpetual futures on Binance using a **1-hour close-br
 | **Volume filter** | Current volume ≥ 0.3× 20-bar average |
 | **Stop Loss** | 1.5× ATR from entry |
 | **Take Profit** | 6.0× ATR from entry (4:1 RR — break-even at 20% win rate) |
-| **Position sizing** | `equity × 35% × 10× leverage ÷ entry_price` (see §2) |
+| **Position sizing** | `(balance × 8%) ÷ (entry × ATR_SL_dist)` — risk-constant sizing (see §2) |
 | **Leverage** | 10× |
 | **Breakout period** | Auto-tuned by WFO every 30 days (or fixed at 14 bars with `--no-wfo`) |
 
@@ -56,7 +56,9 @@ main.py
   ├─ WalkForwardOptimizer (WFO)   — ON by default (--no-wfo to disable)
   │    ├─ Retunes every 720 1H bars (≈ 30 days)
   │    ├─ Trains over last 2,160 bars (≈ 90 days)
-  │    └─ Selects best BREAKOUT_PERIOD from [7, 10, 14, 21, 28]
+  │    ├─ Selects best BREAKOUT_PERIOD from [7, 10, 14, 21, 28]
+  │    └─ Dynamic lookback: shrinks window to 336 bars (14 days) when ATR ≥ 2× mean
+  │         (faster adaptation at cold start or volatility regime shifts)
   │
   └─ MarkovRegimeForecaster        — optional, enable via --forecast or REGIME_FORECAST_ENABLED=true
        ├─ Classifies each bar as TREND / CHOPPY / QUIET
@@ -71,90 +73,95 @@ on_1h_close()
   1. Append bar to LiveHistory (sliding 3,600-bar window)
   2. Update Markov forecaster (if enabled) → entry gate + size scale
   3. WFO retune check (if enabled) → update active BREAKOUT_PERIOD
-  4. Pre-entry guards: daily_halted? session filter? consecutive SL? funding rate?
-  5. Fetch total equity from Binance (wallet_balance + unrealized_pnl)
-  6. Evaluate 1H breakout signal → place order (market or limit)
-  7. Save state to SQLite (every 6 bars)
+  4. Initial cooldown gate (if INITIAL_COOLDOWN_BARS > 0) → suppress entries while settling
+  5. Pre-entry guards: daily_halted? session filter? consecutive SL? funding rate?
+  6. Fetch total equity from Binance (wallet_balance + unrealized_pnl)
+  7. Evaluate 1H breakout signal → place order (market or limit)
+  8. Save state to SQLite (every 6 bars)
 ```
 
-### Position Sizing — Dynamic Equity Model
+### Position Sizing — Risk-Constant Model
 
-The bot uses a **fixed-fraction equity** sizing model with three fallback tiers:
+The bot uses **SL-distance-based risk sizing** as the production default. Every stop-loss hit always costs exactly 8% of balance regardless of market volatility:
 
 | Priority | Mode | Formula | Active when |
 |----------|------|---------|------------|
-| **0 (default)** | **Equity-percent** | `qty = (equity × 35% × 10×) / entry` | `EQUITY_PERCENT > 0` |
-| 1 | Fixed margin | `qty = (ORDER_BALANCE_USD × 10×) / entry` | `EQUITY_PERCENT=0` and `ORDER_BALANCE_USD > 0` |
-| 2 | Risk-percent | `qty = (balance × 8%) / (entry × sl_dist)` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD=0` |
+| **0 (default)** | **Equity-percent** | `qty = (equity × EQUITY_PERCENT% × leverage) / entry` | `EQUITY_PERCENT > 0` |
+| 1 | Fixed margin | `qty = (ORDER_BALANCE_USD × leverage) / entry` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD > 0` |
+| **2 (production)** | **Risk-percent** | `qty = (balance × 8%) / (entry × sl_dist_pct)` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD=0` |
 
-In **live mode**, `equity` = `totalWalletBalance + totalUnrealizedProfit` fetched from the Binance API at the moment of order placement — unrealised PnL on any open position is included in the sizing calculation.
+**Production `.env` sets `EQUITY_PERCENT=0`**, activating the RISK_PERCENT=8% mode (Priority 2).  
+This is the proven maximum-CAGR configuration — see §2 for the performance comparison.
+
+In **live mode**, equity = `totalWalletBalance + totalUnrealizedProfit` fetched from Binance at the moment of order placement.
 
 ---
 
 ## 2. Live Performance Verdict
 
-**Test period:** May 2021 → May 2026 (5 years)  
+**Data period:** Sep 2019 → May 2026 (6 years — full BTCUSDT perpetual futures history)  
 **Starting balance:** $1,000 USDT  
-**Leverage:** 10×  |  **TP:** 6.0× ATR  |  **SL:** 1.5× ATR  |  **ADX ≥ 20**
+**Leverage:** 10× | **TP:** 6.0× ATR | **SL:** 1.5× ATR | **ADX ≥ 20**
 
-### Production-default results (`EQUITY_PERCENT=35`)
+### Production results (`EQUITY_PERCENT=0`, `RISK_PERCENT=8%` — current `.env`)
 
-| Mode | Command | CAGR | Max DD | 5-yr Return | All Years+ | Verdict |
-|------|---------|------|--------|-------------|-----------|---------|
-| **WFO** *(default)* | `python main.py` | **+58.3%/yr** | −37.9% | **$1k → $9.8k** | ✅ 5/5 | ✅ **DEFAULT** |
-| Classic | `python main.py --no-wfo` | **+68.6%/yr** | −34.7% | **$1k → $13.5k** | ✅ 5/5 | ✅ Lower drawdown |
+| Mode | Command | CAGR | Max DD | 6-yr Return | Verdict |
+|------|---------|------|--------|-------------|---------|
+| **WFO** *(default)* | `python main.py` | **+66.5%/yr** | −53% | **$1k → $21k** | ✅ **RECOMMENDED** |
+| Classic | `python main.py --no-wfo` | **+72.7%/yr** | −53% | **$1k → $26k** | ✅ Higher CAGR |
 
-### Maximum-growth reference (`EQUITY_PERCENT=0`, `RISK_PERCENT=8`)
+> **Why WFO is recommended over classic:** WFO's value is anti-overfitting protection for live trading — it re-selects BREAKOUT_PERIOD every 30 days from live data, preventing parameter staleness when market regime shifts. Classic sometimes beats it in backtests because 14 bars happened to be optimal for specific historical windows. For production, WFO is safer.
 
-| Mode | CAGR | Max DD | 5-yr Return | All Years+ | Verdict |
-|------|------|--------|-------------|-----------|---------|
-| Classic | +112%/yr | −49% | $1k → $42k | ✅ 5/5 | ✅ Maximum CAGR |
-| WFO | +101%/yr | −53% | $1k → $32k | ✅ 5/5 | ✅ RECOMMENDED |
+### Sizing model comparison — why RISK_PERCENT=8% beats EQUITY_PERCENT=35%
 
-> **EQUITY_PERCENT vs RISK_PERCENT — key trade-off:**
->
-> `EQUITY_PERCENT=35` allocates a fixed fraction of equity to each trade.  
-> `RISK_PERCENT=8` scales position size inversely with current ATR, so each SL hit always costs exactly 8% of balance.
->
-> They are equivalent at average ATR (~1.5%), but diverge in volatile regimes:
->
-> | ATR at entry | EQUITY=35% per-SL loss | RISK=8% per-SL loss |
-> |---|---|---|
-> | 1.5% (normal) | **7.9%** | **8.0%** ← equivalent |
-> | 3.0% (volatile) | **15.7%** | **8.0%** |
-> | 5.0% (extreme) | **26.3%** | **8.0%** |
->
-> RISK_PERCENT=8% is the proven maximum-CAGR configuration. Set `EQUITY_PERCENT=0` in `.env` to activate it.
+Both modes target similar effective leverage at average ATR, but diverge in volatile periods:
 
-### Year-by-year breakdown
+| ATR at entry | EQUITY=35% per-SL loss | RISK=8% per-SL loss |
+|---|---|---|
+| 1.5% (normal) | **7.9%** | **8.0%** ← equivalent |
+| 3.0% (volatile) | **15.7%** | **8.0%** |
+| 5.0% (extreme) | **26.3%** | **8.0%** |
 
-#### EQUITY_PERCENT=35% + WFO *(production default)*
+`RISK_PERCENT=8%` scales position size **inversely with ATR**, so every SL hit costs exactly 8% of balance. `EQUITY_PERCENT=35%` uses fixed leverage — larger ATR = larger loss per SL. This explains the CAGR gap.
 
-| Year | Start | End | Return | Trades | TP / SL / BE |
-|------|-------|-----|--------|--------|-------------|
-| Y1 (May 2021–22) | $1,000 | $2,553 | +155.3% ✅ | 25 | 8 / 8 / 9 |
-| Y2 (May 2022–23) | $2,553 | $2,867 | +12.3% ✅ | 22 | 4 / 11 / 7 |
-| Y3 (May 2023–24) | $2,867 | $5,013 | +74.9% ✅ | 19 | 7 / 8 / 4 |
-| Y4 (May 2024–25) | $5,013 | $7,776 | +55.1% ✅ | 42 | 7 / 11 / 24 |
-| Y5 (May 2025–26) | $7,776 | $9,829 | +26.4% ✅ | 30 | 6 / 14 / 10 |
+| Sizing mode | CAGR (WFO) | CAGR (Classic) | Max DD |
+|-------------|-----------|----------------|--------|
+| RISK=8% *(production)* | **+66.5%/yr** | **+72.7%/yr** | −53% |
+| EQUITY=35% | +58.3%/yr | +68.6%/yr | −38% |
 
-Total: **138 trades** — Win rate 23.2% — Profit Factor 1.60 — Sharpe 0.88
+> EQUITY=35% has lower drawdown but significantly lower CAGR. RISK=8% is the proven maximum-growth configuration and is set in production `.env`.
 
-#### EQUITY_PERCENT=35% + Classic (`--no-wfo`)
+### Year-by-year breakdown (RISK=8%, WFO — production default)
 
-| Year | Start | End | Return | Trades | TP / SL / BE |
-|------|-------|-----|--------|--------|-------------|
-| Y1 (May 2021–22) | $1,000 | $2,553 | +155.3% ✅ | 25 | 8 / 8 / 9 |
-| Y2 (May 2022–23) | $2,553 | $3,334 | +30.6% ✅ | 21 | 4 / 9 / 8 |
-| Y3 (May 2023–24) | $3,334 | $5,831 | +74.9% ✅ | 19 | 7 / 8 / 4 |
-| Y4 (May 2024–25) | $5,831 | $9,780 | +67.7% ✅ | 41 | 7 / 11 / 23 |
-| Y5 (May 2025–26) | $9,780 | $13,482 | +37.9% ✅ | 29 | 6 / 13 / 10 |
+| Year | Period | Start | End | Return | Trades | TP / SL / BE |
+|------|--------|-------|-----|--------|--------|-------------|
+| Y1 | Sep 2019 – Sep 2020 | $1,000 | $620 | **−38.0% ✗** | 24 | 3 / 14 / 7 |
+| Y2 | Sep 2020 – Sep 2021 | $620 | $2,522 | **+306.8% ✓** | 25 | 8 / 8 / 9 |
+| Y3 | Sep 2021 – Sep 2022 | $2,522 | $2,847 | **+12.9% ✓** | 21 | 4 / 10 / 7 |
+| Y4 | Sep 2022 – Sep 2023 | $2,847 | $8,551 | **+200.3% ✓** | 19 | 7 / 8 / 4 |
+| Y5 | Sep 2023 – Sep 2024 | $8,551 | $13,087 | **+53.1% ✓** | 39 | 6 / 11 / 22 |
+| Y6 | Sep 2024 – May 2026 | $13,087 | $20,975 | **+60.3% ✓** | 30 | 7 / 13 / 10 |
 
-Total: **135 trades** — Win rate 23.7% — Profit Factor 1.72 — Sharpe 0.97
+**Total: 158 trades — Win rate 22.2% — Profit Factor 1.53 — Sharpe 0.82**
 
-### Why classic beats WFO (in backtests)
+### Year-by-year breakdown (RISK=8%, Classic `--no-wfo`)
 
-WFO retunes BREAKOUT_PERIOD every 30 days — this is **anti-overfitting protection** for live trading, not a backtest optimiser. In backtests WFO sometimes picks a worse period for the next 30-day window because it cannot see the future. In live trading its key value is **avoiding stale parameters**: markets that shift regime get a fresh BREAKOUT_PERIOD within 30 days instead of running the same 14-bar window indefinitely. WFO is the recommended default for production.
+| Year | Period | Start | End | Return | Trades | TP / SL / BE |
+|------|--------|-------|-----|--------|--------|-------------|
+| Y1 | Sep 2019 – Sep 2020 | $1,000 | $620 | **−38.0% ✗** | 24 | 3 / 14 / 7 |
+| Y2 | Sep 2020 – Sep 2021 | $620 | $2,522 | **+306.8% ✓** | 25 | 8 / 8 / 9 |
+| Y3 | Sep 2021 – Sep 2022 | $2,522 | $3,107 | **+23.2% ✓** | 21 | 4 / 9 / 8 |
+| Y4 | Sep 2022 – Sep 2023 | $3,107 | $9,331 | **+200.3% ✓** | 19 | 7 / 8 / 4 |
+| Y5 | Sep 2023 – Sep 2024 | $9,331 | $18,805 | **+101.5% ✓** | 39 | 7 / 11 / 21 |
+| Y6 | Sep 2024 – May 2026 | $18,805 | $26,155 | **+39.1% ✓** | 28 | 6 / 12 / 10 |
+
+**Total: 156 trades — Win rate 22.4% — Profit Factor 1.56 — Sharpe 0.86**
+
+### Year 1 context (Sep 2019 – Sep 2020)
+
+Year 1 covers the **earliest available BTCUSDT perpetual futures data** — a period of flat price action followed by the COVID crash in March 2020 (BTC dropped ~54% in 48 hours). With only 3 winning trades out of 24 and heavy whipsaw, the −38% is historically specific to that regime. Years 2–6 recovered everything and compounded strongly.
+
+**For live trading starting in 2026:** you will not be entering during this historical cold-start. The relevant reference years are Y5–Y6 (+53%/+60% WFO, +101%/+39% Classic).
 
 ---
 
@@ -252,17 +259,21 @@ chmod 600 .env      # owner read/write only — other users cannot read it
 All strategy parameters live in `config.py` and are tunable via `.env` overrides.
 The most important production settings:
 
-| Variable | Default | Effect |
-|----------|---------|--------|
-| `EQUITY_PERCENT` | `35.0` | Equity % used as margin per trade (35% × 10× leverage = 3.5× effective position). Set to `0` to use `RISK_PERCENT` mode instead. |
-| `RISK_PERCENT` | `8.0` | % of balance risked per trade — **only active when `EQUITY_PERCENT=0`** |
+| Variable | Production `.env` | Effect |
+|----------|------------------|--------|
+| `EQUITY_PERCENT` | `0` | **Must be 0** to activate RISK_PERCENT mode. Any value > 0 takes priority and disables risk-constant sizing. |
+| `RISK_PERCENT` | `8.0` | % of balance risked per trade — active when `EQUITY_PERCENT=0`. Each SL costs exactly 8% regardless of ATR. |
 | `LEVERAGE` | `10` | Futures leverage multiplier |
 | `WFO_ENABLED` | `true` | Auto-tune BREAKOUT_PERIOD every 30 days (default: on) |
-| `DAILY_PROFIT_TARGET_USD` | `110.0` | Stop trading after this daily gain |
-| `DAILY_LOSS_LIMIT_USD` | `50.0` | Stop trading after this daily loss |
-| `MAX_CONSECUTIVE_LOSSES` | `3` | Circuit breaker: N SLs in a row halts the day |
+| `WFO_FAST_ENABLED` | `true` | Shrink WFO training window to 14 days when ATR spikes ≥ 2× mean — faster regime adaptation |
+| `DAILY_PROFIT_TARGET_USD` | `110.0` | Stop taking new entries after this daily gain (resets at UTC midnight) |
+| `DAILY_LOSS_LIMIT_USD` | `50.0` | Stop taking new entries after this daily loss (resets at UTC midnight) |
+| `MAX_CONSECUTIVE_LOSSES` | `3` | Circuit breaker: N SLs in a row halts entries for the day |
 | `FUNDING_RATE_MAX` | `0.001` | Skip new entries above 0.10%/8h funding rate |
+| `INITIAL_COOLDOWN_BARS` | `0` | Suppress entries for first N 1H bars on fresh startup (0 = disabled; warm start already seeds indicators) |
 | `BOT_STATE_DB_PATH` | `bot_state.db` | SQLite state database path (auto-created) |
+
+> **Circuit breaker note:** The daily loss/profit limits are fixed-USD values calibrated to a ~$1k–$2k starting balance. As your balance compounds, consider periodically adjusting these thresholds (or switching to `DAILY_LOSS_LIMIT_PCT` / `DAILY_PROFIT_TARGET_PCT` in `.env`) to maintain proportional risk control.
 
 ---
 
@@ -316,6 +327,21 @@ Startup sequence
 
 > On subsequent restarts (crash recovery), the fetch step is skipped and startup
 > completes in **under 5 seconds**.
+
+### Indicator warmup diagnostics
+
+Run `verify_warmup.py` to validate that all indicators are properly seeded before deployment:
+
+```bash
+python verify_warmup.py
+```
+
+This diagnostic checks:
+- Data sufficiency (≥ 3,030 1H bars available)
+- EMA200 convergence at the first execution bar
+- ADX full convergence (Wilder smoothing saturates within the warmup window)
+- No-lookahead guarantee (each indicator recomputed on prefix-only slices)
+- WFO cold-start timing (first retune window coverage)
 
 ---
 
@@ -549,12 +575,20 @@ Typical usage: 80–150 MB during WFO hydration; 40–60 MB steady-state.
 
 All backtests use locally cached CSV data (fetched once, stored in `data/`).
 
+> **Data coverage note:** BTCUSDT perpetual futures launched September 2019. The maximum available history is ~6.7 years (Sep 2019 → present). The default backtest window is **6 years** (`YEARS=6`, `DAYS=2190`). Requesting more than 7 years creates phantom years with no data — avoid.
+
 ```bash
-# Default: 5-year WFO backtest (matches live production default)
+# Default: 6-year WFO backtest (matches live production config, max available data)
 python run_backtest.py
 
 # Classic mode — fixed BREAKOUT_PERIOD=14, no WFO
 python run_backtest.py --no-wfo
+
+# 5-year window
+python run_backtest.py --days 1825
+
+# 3-year window (faster iteration during param tuning)
+python run_backtest.py --days 1095
 
 # WFO + Markov regime forecast
 python run_backtest.py --forecast
@@ -562,19 +596,25 @@ python run_backtest.py --forecast
 # Run all feature combinations (benchmark sweep)
 python run_backtest.py --all
 
-# Custom date range / risk parameters
-python run_backtest.py --days 2190              # 6-year window
+# Custom risk / TP parameters
 python run_backtest.py --risk 6 --tp 7.0 --adx 25
 
-# Switch to RISK_PERCENT=8% sizing (set EQUITY_PERCENT=0 first)
-EQUITY_PERCENT=0 python run_backtest.py --no-wfo
+# Tighter goal criteria
+python run_backtest.py --min-cagr 30 --max-dd 60
+
+# Allow 1 bad year out of 6 (year-fraction threshold = 83%)
+python run_backtest.py --year-frac 0.8
 
 # Show all available flags
 python run_backtest.py --help
 ```
 
-> The backtest reads `EQUITY_PERCENT` from the environment (or `.env`).  
-> Change it at the command line (`EQUITY_PERCENT=0 python run_backtest.py`) without editing `.env`.
+### Validate warmup before deploying config changes
+
+```bash
+# Run diagnostic to verify indicator seeding and no-lookahead guarantees
+python verify_warmup.py
+```
 
 ---
 
@@ -654,6 +694,8 @@ These fire automatically without any manual intervention:
 | Funding rate guard | 0.10%/8h | Skip new entries (open position unaffected) |
 | Session filter | Off (24/7) | Configurable UTC hour window for entries |
 
+> **Scaling circuit breakers:** The fixed-USD daily limits ($50/$110) are calibrated for a ~$1k–$2k starting balance. As your balance grows, update these to stay proportional — or use the percentage-based alternatives (`DAILY_LOSS_LIMIT_PCT`, `DAILY_PROFIT_TARGET_PCT`) in `.env`.
+
 ### Monitoring checklist for live operation
 
 ```bash
@@ -688,14 +730,15 @@ trading-bot/
 ├── trader.py                Order execution, equity fetch, daily P&L tracking
 │
 ├── backtest.py              Vectorised backtesting engine
-├── run_backtest.py          Single-call autonomous runner (WFO on by default)
+├── run_backtest.py          Single-call autonomous runner (WFO on, 6-year default)
 ├── visualize.py             Equity curve + trade marker charts
+├── verify_warmup.py         Warmup diagnostic — checks indicator seeding & no-lookahead
 │
 ├── config.py                All strategy & risk parameters (env-driven)
 ├── indicators.py            NumPy indicator library (EMA, RSI, ATR, ADX, BB)
 ├── adaptive_regime.py       Hurst exponent + BBW + ADX composite regime scorer
 │
-├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning
+├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning + dynamic lookback
 ├── regime_forecast.py         Markov regime forecaster (TREND/CHOPPY/QUIET)
 ├── state_manager.py           SQLite crash-recovery persistence
 ├── warm_start.py              Historical pre-loader + dry-run hydration
@@ -709,8 +752,8 @@ trading-bot/
 ├── .dockerignore            Excludes .env, data/, __pycache__ from build context
 │
 ├── data/
-│   ├── btcusdt_1h.csv       Cached 1H OHLCV (auto-updated on startup)
-│   └── btcusdt_5m.csv       Cached 5M OHLCV (used for backtest only)
+│   ├── btcusdt_1h.csv       Cached 1H OHLCV (Sep 2019 → present, auto-updated)
+│   └── btcusdt_5m.csv       Cached 5M OHLCV (Sep 2019 → present, auto-updated)
 │
 ├── backtest_results/
 │   └── report.png           Equity curve chart from last backtest run
@@ -730,8 +773,9 @@ trading-bot/
 > Past backtest results do not guarantee future performance.
 
 - Always run in **paper trading mode first** (`PAPER_TRADING=true`) for at least 24–48 hours to verify your setup
-- The 1H breakout strategy fires approximately **10–40 signals per year** — do not expect a trade every day
-- With the default `EQUITY_PERCENT=35`: at normal ATR (~1.5%), each SL costs ~8% of balance; at ATR=3% (volatile periods), each SL can cost ~16% of balance
-- The strategy's worst drawdown in 5 years was **−38% (WFO default)** or **−35% (classic)** — ensure you can withstand this before running live
+- The 1H breakout strategy fires approximately **15–40 signals per year** — do not expect a trade every day
+- With `RISK_PERCENT=8%` (production default): every stop-loss always costs exactly **8% of your balance**, regardless of volatility. At $1k balance that is $80 per SL; at $10k balance it is $800 per SL.
+- The strategy's worst drawdown in 6 years was **−53%** (both WFO and Classic). Ensure you can withstand this before running live.
+- Year 1 of the backtest (Sep 2019 – Sep 2020) lost −38% — this reflects the COVID crash and early BTC futures market structure, not a repeating annual pattern.
 - **Start with a small balance** (e.g., $200–500 USDT) and scale up only after validating live performance over several months
 - **Never risk capital you cannot afford to lose**

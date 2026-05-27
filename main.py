@@ -162,10 +162,19 @@ async def on_1h_close(mstate: MarketState) -> None:
         _, h1_w, l1_w, c1_w, _, adx_w, atr_w = _live_history.get_indicator_arrays()
         wfo_bar_idx = _live_history.bar_count  # relative index within LiveHistory
         if _wfo.should_retune(wfo_bar_idx):
+            # Pass the current ATR so the optimizer can apply dynamic lookback
+            # (WFO_FAST_ENABLED) when an ATR spike is detected.
+            import math as _math
+            _cur_atr_live = (
+                float(atr_w[-1])
+                if len(atr_w) > 0 and not _math.isnan(float(atr_w[-1]))
+                else None
+            )
             wfo_params = _wfo.optimize(
                 c1=c1_w, h1=h1_w, l1=l1_w,
                 adx_arr=adx_w, atr_arr=atr_w,
                 end_bar=wfo_bar_idx,
+                current_atr=_cur_atr_live,
             )
             _strat_state.active_bp = wfo_params.breakout_period
             pf_str = f"{wfo_params.profit_factor:.2f}" if wfo_params.profit_factor < 99 else "∞"
@@ -181,6 +190,20 @@ async def on_1h_close(mstate: MarketState) -> None:
                 pf=wfo_params.profit_factor,
                 n=wfo_params.n_trades,
             )
+
+    # ── 3b. Initial cooldown gate (indicator settling) ────────────────────────
+    # Suppress entries for the first INITIAL_COOLDOWN_BARS 1H bars after startup.
+    # WFO state above has already been updated (training accumulates normally).
+    # In live mode the warm_start already provides 3,030 bars of indicator history
+    # so EMA200 is fully converged — this guard is mainly useful when
+    # INITIAL_COOLDOWN_BARS is set to a non-zero value for manual testing.
+    if config.INITIAL_COOLDOWN_BARS > 0 and _bar_counter <= config.INITIAL_COOLDOWN_BARS:
+        logger.info(
+            "Initial cooldown: bar %d/%d — indicators settling, no entries",
+            _bar_counter, config.INITIAL_COOLDOWN_BARS,
+        )
+        _maybe_save_state()
+        return
 
     if trader.daily_halted:
         logger.info(

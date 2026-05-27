@@ -156,35 +156,76 @@ class WalkForwardOptimizer:
 
     def optimize(
         self,
-        c1:       np.ndarray,
-        h1:       np.ndarray,
-        l1:       np.ndarray,
-        adx_arr:  np.ndarray,
-        atr_arr:  np.ndarray,
-        end_bar:  int,
+        c1:          np.ndarray,
+        h1:          np.ndarray,
+        l1:          np.ndarray,
+        adx_arr:     np.ndarray,
+        atr_arr:     np.ndarray,
+        end_bar:     int,
+        current_atr: Optional[float] = None,
     ) -> ActiveParams:
         """Run the mini-backtest sweep and update active parameters.
 
         Evaluates every period in :data:`BREAKOUT_GRID` over the training
-        window ``[end_bar − WFO_TRAINING_WINDOW : end_bar]``.  The period
-        with the highest Profit Factor (subject to ``WFO_MIN_TRADES``) is
-        selected.  If no period meets the trade-count minimum, the current
-        ``active_bp`` is preserved unchanged.
+        window ``[end_bar − window : end_bar]``.  The window length is
+        normally ``WFO_TRAINING_WINDOW`` (90 days), but shrinks to
+        ``WFO_FAST_TRAINING_WINDOW`` (14 days) when the current ATR
+        exceeds ``WFO_FAST_ATR_MULT × mean_ATR_in_window`` — allowing
+        faster adaptation out of a cold start or a sudden volatility shift.
+
+        The period with the highest Profit Factor (subject to
+        ``WFO_MIN_TRADES``) is selected.  If no period meets the
+        trade-count minimum, the current ``active_bp`` is preserved.
 
         Args:
-            c1:      1H close price array (full backtest history up to ``end_bar``).
-            h1:      1H high price array.
-            l1:      1H low price array.
-            adx_arr: 1H ADX array.
-            atr_arr: 1H ATR array.
-            end_bar: Index of the last *closed* bar before the apply window begins.
-                     The training window ends here; the apply window starts at
-                     ``end_bar + 1``.
+            c1:          1H close price array (full backtest history up to ``end_bar``).
+            h1:          1H high price array.
+            l1:          1H low price array.
+            adx_arr:     1H ADX array.
+            atr_arr:     1H ATR array.
+            end_bar:     Index of the last *closed* bar before the apply window begins.
+                         The training window ends here; the apply window starts at
+                         ``end_bar + 1``.
+            current_atr: ATR value at ``end_bar`` (used for dynamic lookback check).
+                         Pass ``None`` to always use the standard window.
 
         Returns:
             Updated :class:`ActiveParams` with the winning breakout period.
         """
-        start_bar = max(0, end_bar - config.WFO_TRAINING_WINDOW)
+        # ── Dynamic lookback horizon ──────────────────────────────────────────
+        # Shrink the training window when current ATR is much larger than its
+        # long-run mean — this happens at the start of a new volatility regime
+        # or after a cold-start with sparse history.  The shorter window scores
+        # recent bars more heavily, letting the WFO snap to a new BREAKOUT_PERIOD
+        # within days rather than waiting the full 90-day cycle.
+        training_window = config.WFO_TRAINING_WINDOW
+        _using_fast     = False
+
+        if (
+            config.WFO_FAST_ENABLED
+            and current_atr is not None
+            and not np.isnan(current_atr)
+            and current_atr > 0
+        ):
+            # Compare current ATR against the mean ATR in the standard window
+            _slice_start = max(0, end_bar - config.WFO_TRAINING_WINDOW)
+            _atr_slice   = atr_arr[_slice_start:end_bar]
+            _valid_atr   = _atr_slice[~np.isnan(_atr_slice)]
+            if len(_valid_atr) >= 10:   # need at least 10 valid bars to trust the mean
+                _mean_atr = float(_valid_atr.mean())
+                if _mean_atr > 0 and (current_atr / _mean_atr) >= config.WFO_FAST_ATR_MULT:
+                    training_window = config.WFO_FAST_TRAINING_WINDOW
+                    _using_fast     = True
+                    logger.info(
+                        "WFO dynamic lookback: ATR spike (%.2f× mean %.0f) → "
+                        "shrinking window %d → %d bars (%.1f days)",
+                        current_atr / _mean_atr, _mean_atr,
+                        config.WFO_TRAINING_WINDOW,
+                        config.WFO_FAST_TRAINING_WINDOW,
+                        config.WFO_FAST_TRAINING_WINDOW / 24.0,
+                    )
+
+        start_bar = max(0, end_bar - training_window)
         scores: Dict[int, Tuple[float, int]] = {}
 
         best_bp: int   = self.params.breakout_period   # preserve if no winner
@@ -211,9 +252,11 @@ class WalkForwardOptimizer:
         ))
 
         logger.debug(
-            "WFO retune @ bar %d → BP=%d  PF=%.2f  n=%d  "
+            "WFO retune @ bar %d → BP=%d  PF=%.2f  n=%d  window=%d%s  "
             "scores=%s",
             end_bar, best_bp, best_pf, best_n,
+            training_window,
+            " [FAST]" if _using_fast else "",
             {k: f"{v[0]:.2f}/{v[1]}" for k, v in scores.items()},
         )
         return self.params

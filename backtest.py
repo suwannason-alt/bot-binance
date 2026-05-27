@@ -567,6 +567,7 @@ def run(
     last_trade_1h_bar: int = -9999
     last_trade_5m_bar: int = -9999
     prev_1h_bar: int = -1
+    _first_valid_j: int = -1     # first 1H bar that passes all NaN guards (cooldown anchor)
 
     # ── Daily tracking ────────────────────────────────────────────────────────
     current_day_epoch: int = -1
@@ -929,10 +930,16 @@ def run(
             # for the next interval — no lookahead, applied to future bars only.
             # ══════════════════════════════════════════════════════════════════
             if config.WFO_ENABLED and wfo is not None and wfo.should_retune(j):
+                # Pass current_atr so the optimizer can apply dynamic lookback
+                # when a volatility spike is detected (WFO_FAST_ENABLED).
+                _cur_atr = (
+                    float(atr_1h[j]) if not np.isnan(atr_1h[j]) else None
+                )
                 _wfo_params: ActiveParams = wfo.optimize(
                     c1=c1, h1=h1, l1=l1,
                     adx_arr=adx_1h, atr_arr=atr_1h,
                     end_bar=j,
+                    current_atr=_cur_atr,
                 )
                 strat_state.active_bp = _wfo_params.breakout_period
                 logger.info(
@@ -940,6 +947,17 @@ def run(
                     j, _wfo_params.breakout_period,
                     _wfo_params.profit_factor, _wfo_params.n_trades,
                 )
+
+            # ── Initial cooldown gate ─────────────────────────────────────────
+            # Suppress all entries for the first INITIAL_COOLDOWN_BARS 1H bars
+            # after the first valid execution bar.  WFO keeps running above so
+            # its training history accumulates; only signal evaluation is skipped.
+            # Useful for short backtests where EMA200 is still SMA-seeded.
+            if config.INITIAL_COOLDOWN_BARS > 0:
+                if _first_valid_j < 0:
+                    _first_valid_j = j          # anchor: first bar that passed NaN guards
+                if j < _first_valid_j + config.INITIAL_COOLDOWN_BARS:
+                    continue
 
             # ── Select rolling extremes for the active breakout period ────────
             _active_bp = strat_state.active_bp if config.WFO_ENABLED else config.BREAKOUT_PERIOD

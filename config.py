@@ -384,6 +384,44 @@ WFO_TRAINING_WINDOW  = int(os.getenv("WFO_TRAINING_WINDOW",  "2160"))  # bars of
 WFO_MIN_TRADES       = int(os.getenv("WFO_MIN_TRADES",       "4"))     # min trades required to accept BP
 WFO_CHOPPY_COOLDOWN  = int(os.getenv("WFO_CHOPPY_COOLDOWN",  "6"))     # extended cooldown (bars) when forecast is choppy
 
+# ── WFO dynamic lookback (volatility-adaptive in-sample window) ───────────────
+# When WFO_FAST_ENABLED=true and the current ATR exceeds WFO_FAST_ATR_MULT ×
+# the mean ATR in the standard training window, the optimizer shrinks the
+# training window to WFO_FAST_TRAINING_WINDOW bars.  This lets the WFO adapt
+# faster out of a cold start or a sudden volatility regime shift without
+# sacrificing the long-window stability in normal conditions.
+#
+# Interpretation of defaults:
+#   WFO_FAST_ATR_MULT=2.0    → ATR must be ≥ 2× its 90-day mean to trigger
+#   WFO_FAST_TRAINING_WINDOW=336 → fallback window = 14 days (enough for
+#                                   all 5 breakout periods to record ≥ 4 trades)
+#
+# Set WFO_FAST_ENABLED=false to always use the standard WFO_TRAINING_WINDOW.
+WFO_FAST_ENABLED         = os.getenv("WFO_FAST_ENABLED", "true").lower() == "true"
+WFO_FAST_TRAINING_WINDOW = int(os.getenv("WFO_FAST_TRAINING_WINDOW", "336"))   # 14 days
+WFO_FAST_ATR_MULT        = float(os.getenv("WFO_FAST_ATR_MULT",      "2.0"))   # ATR spike multiplier
+
+# ── Initial cooldown (indicator settling guard) ────────────────────────────────
+# When INITIAL_COOLDOWN_BARS > 0, the bot tracks indicators and updates the WFO
+# state for the first N 1H bars after startup / the start of a backtest, but
+# suppresses ALL trade entries during this period.
+#
+# Purpose: let EMA200 (time constant ≈ 100 bars) and WFO (needs ≥ WFO_MIN_TRADES
+# in the mini-backtest) stabilise before risking capital.  The WFO still runs
+# its retune check; only the signal evaluation and order placement are skipped.
+#
+# Recommended values:
+#   0   = disabled (default, safe for 5-year backtests where EMA200 converges
+#         naturally within a few months of the start date).
+#   24  = 1-day settle (1H bars):  EMA200 seed weight drops from 89.6% → 81.3%.
+#   48  = 2-day settle:  EMA200 seed weight drops to  73.8%.
+#   168 = 1-week settle: EMA200 seed weight drops to  18.7%.
+#
+# For LIVE mode, the warm_start fetch (3,030 bars) already ensures EMA200 is
+# fully converged (<0.001% seed weight) before the first live bar fires.
+# INITIAL_COOLDOWN_BARS is mainly useful for short (< 1yr) backtests.
+INITIAL_COOLDOWN_BARS = int(os.getenv("INITIAL_COOLDOWN_BARS", "0"))
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MARKOV REGIME FORECAST  (OFF by default — enable via .env or --forecast flag)
 # ══════════════════════════════════════════════════════════════════════════════

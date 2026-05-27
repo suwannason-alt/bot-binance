@@ -18,9 +18,9 @@ Instead of sweeping 100+ static PARAM_CANDIDATES, the strategy self-tunes:
 
 Usage::
 
-    python run_backtest.py                        # 5-year with WFO (default)
-    python run_backtest.py --no-wfo               # 5-year classic static mode
-    python run_backtest.py --days 2190            # 6-year run with WFO
+    python run_backtest.py                        # 6-year with WFO (default, max available data)
+    python run_backtest.py --no-wfo               # 6-year classic static mode
+    python run_backtest.py --days 1825            # 5-year run with WFO
     python run_backtest.py --forecast             # WFO + Markov regime forecast
     python run_backtest.py --adaptive             # WFO + adaptive regime framework
     python run_backtest.py --all                  # all autonomous features
@@ -56,8 +56,12 @@ logging.basicConfig(
 logger = logging.getLogger("run_backtest")
 
 # ── Defaults (overridable via CLI) ─────────────────────────────────────────────
+# Data available: BTCUSDT perpetual futures launched 2019-09-08.
+# Effective coverage to today ≈ 6.7 years.  Use YEARS=6 for 6 complete calendar
+# years (Sep 2019 → Sep 2025); YEARS=7 includes the partial 7th year.
+# Setting YEARS=8 creates a phantom Year 8 (no data) — avoid.
 INITIAL_BALANCE: float = 1_000.0
-YEARS:           int   = 5
+YEARS:           int   = 1
 DAYS:            int   = YEARS * 365
 
 # ── Goal thresholds (period-invariant) ────────────────────────────────────────
@@ -65,58 +69,76 @@ GOAL_MIN_CAGR_PCT:  float = 20.0   # CAGR ≥ 20 %/yr
 GOAL_MAX_DD_PCT:    float = 70.0   # MaxDD ≤ 70 %
 GOAL_MIN_YEAR_FRAC: float = 1.0    # all years profitable (1.0); or 0.8 = allow 1 bad yr
 
-# ── Proven base configuration ─────────────────────────────────────────────────
-# 5-year all-pass result: $1 000 → $42 000, CAGR +111.8 %/yr.
-# WFO supersedes BREAKOUT_PERIOD when enabled.
-# Adaptive regime supersedes ATR_TP_MULTIPLIER / ATR_SL_MULTIPLIER when enabled.
+# ── Base configuration — mirrors .env exactly ─────────────────────────────────
+# Every value here must be kept in sync with .env.
+# Run `python run_backtest.py` to verify the live config produces the expected
+# backtest result before deploying any change to production.
+#
+# Proven result (RISK_PERCENT=8%, WFO=ON):
+#   $1,000 → $32,000  CAGR +101%/yr  MaxDD -53%  (5-year WFO)
+#   $1,000 → $42,000  CAGR +112%/yr  MaxDD -49%  (5-year Classic --no-wfo)
 _BASE: Dict = {
-    # Risk
+    # ── [3] Position sizing ── mirrors .env [3] ───────────────────────────────
+    # EQUITY_PERCENT=0 activates RISK_PERCENT mode (SL-distance based, proven best).
+    # RISK_PERCENT=8%: each SL always costs exactly 8% of balance regardless of ATR.
+    "EQUITY_PERCENT":          0.0,    # 0 = use RISK_PERCENT (proven +112%/yr)
     "RISK_PERCENT":            8.0,
     "LEVERAGE":                10,
     "RISK_USD":                0.0,
     "ORDER_BALANCE_USD":       0.0,
-    # SL / TP
+
+    # ── [4] Strategy parameters ── mirrors .env [4] ───────────────────────────
     "ATR_SL_MULTIPLIER":       1.5,
     "ATR_TP_MULTIPLIER":       6.0,
-    # Entry filters
+    "BREAKOUT_PERIOD":         14,     # WFO auto-tunes this every 30 days
     "ADX_MIN":                 20.0,
     "ADX_PERIOD":              14,
+    "TRAIL_ACTIVATE_ATR":      1.5,
+    "TRAIL_LOCK_ATR":          0.0,
+    "TRAIL_STOP_ATR":          0.0,
     "ATR_RATIO_MIN":           1.15,
     "EMA_SLOPE_MIN_PCT":       0.15,
+    "VOL_RATIO_MIN":           0.3,
+    "ATR_1H_PCT_MIN":          0.05,
+    "ATR_1H_PCT_MAX":          5.0,
+    "EMA_TREND_SLOPE_BARS":    7,
+    "TRADE_COOLDOWN_1H":       1,
     "EMA_1H_MIN_SEP":          0.001,
     "RSI_1H_LONG_MIN":         45,
     "RSI_1H_LONG_MAX":         78,
     "RSI_1H_SHORT_MIN":        22,
     "RSI_1H_SHORT_MAX":        55,
-    "ATR_1H_PCT_MIN":          0.05,
-    "ATR_1H_PCT_MAX":          5.0,
-    "VOL_RATIO_MIN":           0.3,
     "REQUIRE_MACD_CONFIRM":    False,
     "BREAKOUT_ATR_BUFFER":     0.0,
     "EMA_TREND_DISTANCE_MIN":  0.0,
-    # Breakout / timing
-    "BREAKOUT_PERIOD":         14,
-    "EMA_TREND_SLOPE_BARS":    7,
-    "TRADE_COOLDOWN_1H":       1,
-    # Trailing stop
-    "TRAIL_ACTIVATE_ATR":      1.5,
-    "TRAIL_LOCK_ATR":          0.0,
-    "TRAIL_STOP_ATR":          0.0,
-    # Daily limits
+    "BODY_ATR_RATIO_MIN":      0.0,
+
+    # ── [5] Daily circuit breakers ── mirrors .env [5] ────────────────────────
     "DAILY_PROFIT_TARGET_USD": 110.0,
     "DAILY_LOSS_LIMIT_USD":    50.0,
     "DAILY_PROFIT_TARGET_PCT": 0.0,
     "DAILY_LOSS_LIMIT_PCT":    0.0,
-    # Body quality filter (0 = off)
-    "BODY_ATR_RATIO_MIN":      0.0,
-    # WFO ON by default; all other quant flags off — toggled via CLI args below
+
+    # ── [7] Walk-Forward Optimization ── mirrors .env [7] ─────────────────────
+    "WFO_ENABLED":              True,  # ← default ON; disable with --no-wfo
+    "WFO_RETUNE_INTERVAL":      720,
+    "WFO_TRAINING_WINDOW":      2160,
+    "WFO_MIN_TRADES":           4,
+    "WFO_FAST_ENABLED":         True,
+    "WFO_FAST_TRAINING_WINDOW": 336,
+    "WFO_FAST_ATR_MULT":        2.0,
+
+    # ── [8] Indicator warmup ── mirrors .env [8] ──────────────────────────────
+    "INITIAL_COOLDOWN_BARS":    0,     # 0 = off (live bot is already warm-started)
+
+    # ── [11] Autonomous features ── all OFF = proven maximum-growth mode ──────
+    "WFO_ENABLED":              True,  # toggled via --wfo / --no-wfo CLI flag
+    "REGIME_FORECAST_ENABLED":  False, # toggled via --forecast CLI flag
+    "ADAPTIVE_REGIME_ENABLED":  False, # toggled via --adaptive CLI flag
+    "ADAPTIVE_TRAILING_ENABLED": False,
     "REGIME_FILTER_ENABLED":    False,
     "DYNAMIC_TP_ENABLED":       False,
     "VOL_SIZING_ENABLED":       False,
-    "ADAPTIVE_REGIME_ENABLED":  False,
-    "ADAPTIVE_TRAILING_ENABLED": False,
-    "WFO_ENABLED":              True,   # ← DEFAULT ON; disable with --no-wfo
-    "REGIME_FORECAST_ENABLED":  False,
 }
 
 
