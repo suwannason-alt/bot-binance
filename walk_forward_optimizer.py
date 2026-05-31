@@ -49,6 +49,7 @@ Profit Factor is preferred over total return as the selection metric because:
 """
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -57,6 +58,10 @@ import numpy as np
 import pandas as pd
 
 import config
+
+# Maximum number of WFO retune records kept in memory.
+# One retune per 30 days → 200 entries ≈ 16+ years before the list cycles.
+_MAX_LOG_ENTRIES = 200
 
 logger = logging.getLogger("wfo")
 
@@ -250,6 +255,9 @@ class WalkForwardOptimizer:
         self.log.append(WFOLogEntry(
             bar=end_bar, bp=best_bp, pf=best_pf, n=best_n, scores=scores
         ))
+        # Prevent unbounded log growth over long live sessions
+        if len(self.log) > _MAX_LOG_ENTRIES:
+            self.log = self.log[-_MAX_LOG_ENTRIES:]
 
         logger.debug(
             "WFO retune @ bar %d → BP=%d  PF=%.2f  n=%d  window=%d%s  "
@@ -259,6 +267,11 @@ class WalkForwardOptimizer:
             " [FAST]" if _using_fast else "",
             {k: f"{v[0]:.2f}/{v[1]}" for k, v in scores.items()},
         )
+
+        # Release the scores dict and rolling-slice temporaries created during
+        # the sweep, then force a GC pass so Python returns the pages promptly.
+        del scores
+        gc.collect()
         return self.params
 
     # ------------------------------------------------------------------

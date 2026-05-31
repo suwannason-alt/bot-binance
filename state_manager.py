@@ -60,6 +60,7 @@ import json
 import logging
 import os
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -119,11 +120,24 @@ class StateManager:
                 );
             """)
 
-    def _connect(self) -> sqlite3.Connection:
-        """Return a new SQLite connection with WAL journal mode."""
+    @contextmanager
+    def _connect(self):
+        """Open a WAL-mode SQLite connection, commit on exit, always close.
+
+        sqlite3.Connection used as a plain context manager only commits or
+        rolls back — it never closes the connection.  Every call to _connect()
+        must therefore close explicitly; this context manager enforces that.
+        """
         conn = sqlite3.connect(self._db_path, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL;")
-        return conn
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # Save

@@ -9,6 +9,7 @@ Assumptions:
 """
 from __future__ import annotations
 
+import gc
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -947,6 +948,10 @@ def run(
                     j, _wfo_params.breakout_period,
                     _wfo_params.profit_factor, _wfo_params.n_trades,
                 )
+                # wfo.optimize() already calls gc.collect() internally; call
+                # here too to reclaim backtest-level temporaries every retune.
+                del _wfo_params, _cur_atr
+                gc.collect()
 
             # ── Initial cooldown gate ─────────────────────────────────────────
             # Suppress all entries for the first INITIAL_COOLDOWN_BARS 1H bars

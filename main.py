@@ -31,6 +31,7 @@ Usage::
 """
 import argparse
 import asyncio
+import gc
 import logging
 import signal
 import sys
@@ -55,6 +56,23 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("main")
+
+
+def _rss_mb() -> float:
+    """Return current process RSS in MB. Reads /proc/self/status (Linux)."""
+    try:
+        import psutil
+        return psutil.Process().memory_info().rss / 1_048_576
+    except Exception:
+        pass
+    try:
+        with open("/proc/self/status") as _f:
+            for _line in _f:
+                if _line.startswith("VmRSS:"):
+                    return int(_line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    return 0.0
 
 # ── Core live objects ──────────────────────────────────────────────────────────
 state  = MarketState()
@@ -113,9 +131,8 @@ async def on_1h_close(mstate: MarketState) -> None:
 
     # ── 1. Append the just-closed candle to LiveHistory ───────────────────────
     if _live_history is not None and mstate.buf_1h.count > 0:
-        # Pull the last bar from the buffer arrays
-        _, h1_live, l1_live, c1_live, v1_live = mstate.buf_1h.arrays()
-        o1_live, _, _, _, _ = mstate.buf_1h.arrays()
+        # Single arrays() call — previous code called it twice (bug: 10 allocs not 5)
+        o1_live, h1_live, l1_live, c1_live, v1_live = mstate.buf_1h.arrays()
         if len(c1_live) > 0:
             _live_history.append_candle(
                 open_  = float(o1_live[-1]),
@@ -124,12 +141,23 @@ async def on_1h_close(mstate: MarketState) -> None:
                 close  = float(c1_live[-1]),
                 volume = float(v1_live[-1]),
             )
+        del o1_live, h1_live, l1_live, c1_live, v1_live
+
+    # ── Pre-compute indicator arrays once and share between §2 and §3 ─────────
+    # get_indicator_arrays() recomputes ADX+ATR over 3 600 bars (>10 tmp allocs).
+    # Computing it once instead of twice per bar halves per-hour peak allocation.
+    _ind_arrs = None
+    if _live_history is not None and (
+        (config.REGIME_FORECAST_ENABLED and _forecaster is not None)
+        or (config.WFO_ENABLED and _wfo is not None)
+    ):
+        _ind_arrs = _live_history.get_indicator_arrays()
 
     # ── 2. Forecaster update (REGIME_FORECAST_ENABLED) ───────────────────────
-    if config.REGIME_FORECAST_ENABLED and _forecaster is not None and _live_history is not None:
+    if config.REGIME_FORECAST_ENABLED and _forecaster is not None and _ind_arrs is not None:
         import indicators as _ind
         from adaptive_regime import hurst_exponent as _hurst
-        _, h1_fc, l1_fc, c1_fc, _, adx_fc, atr_fc = _live_history.get_indicator_arrays()
+        _, h1_fc, l1_fc, c1_fc, _, adx_fc, atr_fc = _ind_arrs
         if len(c1_fc) > 0 and not (
             __import__("math").isnan(adx_fc[-1]) or __import__("math").isnan(atr_fc[-1])
         ):
@@ -158,8 +186,8 @@ async def on_1h_close(mstate: MarketState) -> None:
                 _strat_state.size_scale         = min(1.0, 0.5 + _fc.trend_prob)
 
     # ── 3. WFO retune (WFO_ENABLED) ──────────────────────────────────────────
-    if config.WFO_ENABLED and _wfo is not None and _live_history is not None:
-        _, h1_w, l1_w, c1_w, _, adx_w, atr_w = _live_history.get_indicator_arrays()
+    if config.WFO_ENABLED and _wfo is not None and _ind_arrs is not None:
+        _, h1_w, l1_w, c1_w, _, adx_w, atr_w = _ind_arrs
         wfo_bar_idx = _live_history.bar_count  # relative index within LiveHistory
         if _wfo.should_retune(wfo_bar_idx):
             # Pass the current ATR so the optimizer can apply dynamic lookback
@@ -190,6 +218,15 @@ async def on_1h_close(mstate: MarketState) -> None:
                 pf=wfo_params.profit_factor,
                 n=wfo_params.n_trades,
             )
+
+    # ── Release shared indicator arrays and run periodic GC ──────────────────
+    del _ind_arrs
+    if _bar_counter % 24 == 0:   # once per calendar day
+        gc.collect()
+        logger.info("GC sweep  bar=%d  mem=%.1f MB", _bar_counter, _rss_mb())
+
+    # ── Memory log every 1H candle close ─────────────────────────────────────
+    logger.debug("1H close mem=%.1f MB  bar=%d", _rss_mb(), _bar_counter)
 
     # ── 3b. Initial cooldown gate (indicator settling) ────────────────────────
     # Suppress entries for the first INITIAL_COOLDOWN_BARS 1H bars after startup.
@@ -392,7 +429,8 @@ async def on_tick(mstate: MarketState, price: float) -> None:
             f"♥ mark={price:.2f}  balance={trader.balance:.2f}  "
             f"day_pnl={trader.day_pnl:+.2f}  trades={stats['trades']}  "
             f"WR={stats['win_rate']:.0f}%  consec_SL={stats['consecutive_losses']}"
-            f"{pos_str}  funding={mstate.funding_rate:.4%}"
+            f"{pos_str}  funding={mstate.funding_rate:.4%}  "
+            f"mem={_rss_mb():.0f}MB"
         )
 
 
