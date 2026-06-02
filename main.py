@@ -326,11 +326,17 @@ async def on_1h_close(mstate: MarketState) -> None:
                 f"balance={trader.balance:.2f} USDT  day_pnl={trader.day_pnl:+.2f}"
             )
     else:
-        logger.debug(
-            f"No 1H signal  buf={mstate.buf_1h.count}  mark={mstate.mark_price:.2f}  "
-            f"funding={mstate.funding_rate:.4%}  day_pnl={trader.day_pnl:+.2f}  "
-            f"bars_since={_bars_since_last_1h}  BP={_strat_state.active_bp}"
+        # ── Entry-funnel diagnostic — observability only, never gates trades ──
+        diag = strategy.diagnose_1h_live(mstate, _bars_since_last_1h)
+        ctx = (
+            f"No 1H signal  mark={mstate.mark_price:.2f}  BP={_strat_state.active_bp}bars  "
+            f"bars_since={_bars_since_last_1h}  funding={mstate.funding_rate:.4%}  "
+            f"day_pnl={trader.day_pnl:+.2f}"
         )
+        if diag is not None:
+            logger.info(f"{ctx}\n{diag.text}")
+        else:
+            logger.info(f"{ctx}  (buffer warming: {mstate.buf_1h.count}/{config.MIN_CANDLES_1H})")
 
     # ── 6. State persistence ──────────────────────────────────────────────────
     _maybe_save_state()

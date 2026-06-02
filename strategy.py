@@ -442,6 +442,185 @@ def evaluate_1h_signal(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Entry-funnel diagnostic  (observability only — never gates trades)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class SignalDiagnostics:
+    """Structured entry-funnel report for a single 1H bar.
+
+    Attributes:
+        text:   Multi-line funnel block, ready for the live log.
+        passed: ``True`` iff every gate passed — identical to
+                ``evaluate_1h_signal(...) is not None`` under the live config.
+        failed: Short names of the gates that blocked entry (human summary).
+    """
+
+    text: str
+    passed: bool
+    failed: list
+
+
+def format_signal_diagnostics(i1: dict, bars_since_last: int = 9999) -> SignalDiagnostics:
+    """Render the entry-funnel diagnostic for one 1H bar.
+
+    Re-derives every gate of the **classic live path** of
+    :func:`evaluate_1h_signal` (the proven production config — adaptive-regime
+    and regime-filter OFF) from the same ``i1`` dict and ``config`` thresholds,
+    then reports each gate's actual value against its threshold.  Unlike the
+    evaluator it does **not** short-circuit, so the full funnel is always shown.
+
+    This is an OBSERVABILITY layer only — it never influences trading.  The
+    ``passed`` verdict is computed from the identical booleans the evaluator
+    uses, a property locked by ``test_signal_diagnostics.py``.
+
+    Args:
+        i1: Indicator dict from :func:`compute_1h_indicators`.
+        bars_since_last: 1H bars since the previous trade (cooldown gate).
+
+    Returns:
+        A :class:`SignalDiagnostics` with the rendered block and verdict.
+    """
+    lines: list = []
+    failed: list = []
+
+    def gate(label: str, ok: bool, value: str, cond: str, tag: str) -> None:
+        status = "PASS" if ok else "FAIL"
+        lines.append(f"  {label:<15}: {str(value):<26} [{status}  {cond}]")
+        if not ok:
+            failed.append(tag)
+
+    # ── Unpack ────────────────────────────────────────────────────────────────
+    ema_f = i1.get("ema_fast"); ema_s = i1.get("ema_slow"); ema_t = i1.get("ema_trend")
+    rsi   = i1.get("rsi");      atr   = i1.get("atr");      close = i1.get("close")
+    open_ = i1.get("open")
+    ema_t_prev  = i1.get("ema_trend_prev")
+    vol_ratio   = i1.get("vol_ratio")
+    rolling_max = i1.get("rolling_max"); rolling_min = i1.get("rolling_min")
+    atr_ratio   = i1.get("atr_ratio");   adx_val = i1.get("adx")
+    hist = i1.get("macd_hist"); h_prv = i1.get("macd_hist_prev")
+
+    header = "  ── Entry funnel (no signal) " + "─" * 30
+
+    # ── Gate: cooldown ────────────────────────────────────────────────────────
+    cd_ok = bars_since_last >= config.TRADE_COOLDOWN_1H
+    gate("Cooldown", cd_ok, f"{bars_since_last} bars", f">= {config.TRADE_COOLDOWN_1H}", "cooldown")
+
+    # ── Gate: data sanity ─────────────────────────────────────────────────────
+    data_ok = (all(v is not None for v in [ema_f, ema_s, ema_t, rsi, atr, close])
+               and close not in (0, None) and atr not in (0, None))
+    if not data_ok:
+        gate("Data", False, "missing/zero", "all indicators present", "data")
+        text = header + "\n" + "\n".join(lines) + "\n  VERDICT: insufficient data → blocked"
+        return SignalDiagnostics(text=text, passed=False, failed=failed)
+
+    atr_pct = atr / close * 100
+    regime  = detect_regime(adx_val, atr_pct, atr_ratio)   # informational only
+
+    # ── Directional bias (for the breakout/RSI/slope display) ─────────────────
+    bias = "LONG" if ema_f > ema_s else "SHORT" if ema_f < ema_s else "NEUTRAL"
+    arrow = ">" if ema_f > ema_s else "<" if ema_f < ema_s else "="
+    lines.append(f"  Trend bias     : {bias} (ema20{arrow}ema50, "
+                 f"close {'>' if close > ema_t else '<'} ema200, regime={regime})")
+
+    # ── Standalone early-return gates ─────────────────────────────────────────
+    sep    = abs(ema_f - ema_s) / ema_s
+    sep_ok = sep >= config.EMA_1H_MIN_SEP
+    gate("EMA separation", sep_ok, f"{sep * 100:.2f}%", f">= {config.EMA_1H_MIN_SEP * 100:.2f}%", "sep")
+
+    atr_ok = config.ATR_1H_PCT_MIN < atr_pct < config.ATR_1H_PCT_MAX
+    gate("ATR %", atr_ok, f"{atr_pct:.2f}%", f"in {config.ATR_1H_PCT_MIN}-{config.ATR_1H_PCT_MAX}%", "atr_pct")
+
+    vol_ok = vol_ratio is None or vol_ratio >= config.VOL_RATIO_MIN
+    gate("Volume ratio", vol_ok, "n/a" if vol_ratio is None else f"{vol_ratio:.2f}",
+         f">= {config.VOL_RATIO_MIN}", "volume")
+
+    atrr_ok = not (config.ATR_RATIO_MIN > 0 and atr_ratio is not None and atr_ratio < config.ATR_RATIO_MIN)
+    gate("ATR ratio", atrr_ok, "n/a" if atr_ratio is None else f"{atr_ratio:.2f}",
+         f">= {config.ATR_RATIO_MIN}  (expanding vol)", "atr_ratio")
+
+    adx_ok = not (config.ADX_MIN > 0 and adx_val is not None and adx_val < config.ADX_MIN)
+    gate("ADX", adx_ok, "n/a" if adx_val is None else f"{adx_val:.1f}", f">= {config.ADX_MIN}", "adx")
+
+    # ── Directional conditions (mirror evaluate_1h_signal long_ok / short_ok) ──
+    ema_dist_pct      = (close - ema_t) / ema_t * 100
+    ema_dist_ok_long  =   ema_dist_pct  >= config.EMA_TREND_DISTANCE_MIN
+    ema_dist_ok_short = (-ema_dist_pct) >= config.EMA_TREND_DISTANCE_MIN
+    if config.EMA_SLOPE_MIN_PCT > 0 and ema_t_prev is not None:
+        slope_needed  = ema_t * (config.EMA_SLOPE_MIN_PCT / 100)
+        trend_rising  = (ema_t - ema_t_prev) >= slope_needed
+        trend_falling = (ema_t_prev - ema_t) >= slope_needed
+    else:
+        trend_rising  = ema_t_prev is None or ema_t >= ema_t_prev
+        trend_falling = ema_t_prev is None or ema_t <= ema_t_prev
+    macd_long_ok  = hist is not None and h_prv is not None and hist > 0 and hist > h_prv
+    macd_short_ok = hist is not None and h_prv is not None and hist < 0 and hist < h_prv
+    bo_buf = atr * config.BREAKOUT_ATR_BUFFER
+
+    long_ok = (ema_f > ema_s and ema_dist_ok_long and trend_rising
+               and config.RSI_1H_LONG_MIN <= rsi <= config.RSI_1H_LONG_MAX
+               and rolling_max is not None and close > rolling_max + bo_buf
+               and (not config.REQUIRE_MACD_CONFIRM or macd_long_ok))
+    short_ok = (ema_f < ema_s and ema_dist_ok_short and trend_falling
+                and config.RSI_1H_SHORT_MIN <= rsi <= config.RSI_1H_SHORT_MAX
+                and rolling_min is not None and close < rolling_min - bo_buf
+                and (not config.REQUIRE_MACD_CONFIRM or macd_short_ok))
+    dir_ok = long_ok or short_ok
+
+    # Directional detail lines (for the biased side; SHORT mirrors LONG) ───────
+    short_side = bias == "SHORT"
+    pos_ok   = ema_dist_ok_short if short_side else ema_dist_ok_long
+    gate("EMA200 position", pos_ok, f"close {'<' if short_side else '>'} ema200  ({ema_dist_pct:+.2f}%)",
+         f"{'below' if short_side else 'above'} by >= {config.EMA_TREND_DISTANCE_MIN}%", "ema200_pos")
+
+    slope_pct = ((ema_t - ema_t_prev) / ema_t * 100) if ema_t_prev else 0.0
+    gate("EMA200 slope", (trend_falling if short_side else trend_rising), f"{slope_pct:+.3f}%",
+         f">= {config.EMA_SLOPE_MIN_PCT}% {'falling' if short_side else 'rising'}", "ema_slope")
+
+    if short_side:
+        rsi_ok = config.RSI_1H_SHORT_MIN <= rsi <= config.RSI_1H_SHORT_MAX
+        rsi_cond = f"in {config.RSI_1H_SHORT_MIN}-{config.RSI_1H_SHORT_MAX}"
+    else:
+        rsi_ok = config.RSI_1H_LONG_MIN <= rsi <= config.RSI_1H_LONG_MAX
+        rsi_cond = f"in {config.RSI_1H_LONG_MIN}-{config.RSI_1H_LONG_MAX}"
+    gate("RSI", rsi_ok, f"{rsi:.1f}", rsi_cond, "rsi")
+
+    bp = config.BREAKOUT_PERIOD
+    lvl = rolling_min if short_side else rolling_max
+    bo_ok = short_ok if short_side else long_ok
+    if lvl is None:
+        bo_val = "n/a (warming up)"
+    elif short_side:
+        bo_val = f"close {close:,.0f} vs {bp}-bar low {lvl:,.0f}"
+    else:
+        bo_val = f"close {close:,.0f} vs {bp}-bar high {lvl:,.0f}"
+    gate(f"Breakout {bias}", bo_ok, bo_val,
+         f"close {'<' if short_side else '>'} {'low' if short_side else 'high'} {'-' if short_side else '+'} buf", "breakout")
+
+    # ── Body quality (off in production: BODY_ATR_RATIO_MIN = 0) ───────────────
+    body_ok = not (config.BODY_ATR_RATIO_MIN > 0 and open_ is not None
+                   and abs(close - open_) / atr < config.BODY_ATR_RATIO_MIN)
+    if config.BODY_ATR_RATIO_MIN > 0:
+        gate("Candle body", body_ok, f"{abs(close - open_) / atr:.2f} xATR",
+             f">= {config.BODY_ATR_RATIO_MIN}", "body")
+
+    # ── Verdict — computed from the SAME booleans as evaluate_1h_signal ───────
+    passed = (cd_ok and data_ok and sep_ok and atr_ok and vol_ok
+              and atrr_ok and adx_ok and dir_ok and body_ok)
+    if not dir_ok and "breakout" not in failed and "rsi" not in failed \
+            and "ema_slope" not in failed and "ema200_pos" not in failed:
+        failed.append("directional")   # e.g. NEUTRAL bias (ema20 == ema50)
+
+    if passed:
+        verdict = "  VERDICT: ALL GATES PASS → signal would fire"
+    else:
+        verdict = f"  VERDICT: blocked by {len(failed)} gate(s) → {', '.join(failed)}"
+    text = header + "\n" + "\n".join(lines) + "\n  " + "─" * 56 + "\n" + verdict
+
+    return SignalDiagnostics(text=text, passed=passed, failed=failed)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 5M scalp evaluator  (live WebSocket mode)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -582,23 +761,25 @@ def evaluate(state: MarketState, bars_since_last_trade: int = 9999) -> Optional[
 # 1H live evaluator  (mirrors backtest strategy exactly)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate_1h_live(state: MarketState, bars_since_last: int = 9999) -> Optional[Signal]:
-    """Evaluate a 1H breakout signal for live trading.
+def compute_1h_indicators(
+    o1: np.ndarray,
+    h1: np.ndarray,
+    l1: np.ndarray,
+    c1: np.ndarray,
+    v1: np.ndarray,
+) -> dict:
+    """Build the 1H indicator dict consumed by :func:`evaluate_1h_signal`.
 
-    Mirrors the proven backtest strategy exactly, including all quantitative
-    enhancements.  Called by ``main.on_1h_close`` on every closed 1H bar.
+    Extracted verbatim from :func:`evaluate_1h_live` so the live evaluator and
+    the entry-funnel diagnostic share **one** source of truth for how ``i1`` is
+    assembled.  Pure function of the raw 1H OHLCV arrays plus ``config``.
 
     Args:
-        state: Current :class:`~data_store.MarketState` with live candle buffers.
-        bars_since_last: Number of 1H bars elapsed since the previous trade.
+        o1, h1, l1, c1, v1: Raw 1H open/high/low/close/volume arrays.
 
     Returns:
-        A :class:`Signal` if all entry conditions are satisfied, otherwise ``None``.
+        The enriched indicator dictionary for the most recent closed 1H bar.
     """
-    if state.buf_1h.count < config.MIN_CANDLES_1H:
-        return None
-
-    o1, h1, l1, c1, v1 = state.buf_1h.arrays()
     i1 = ind.compute_all(o1, h1, l1, c1, config, volumes=v1)
 
     # ── EMA200 (macro trend) ──────────────────────────────────────────────────
@@ -647,4 +828,46 @@ def evaluate_1h_live(state: MarketState, bars_since_last: int = 9999) -> Optiona
             adx_min_relax = config.ADAPTIVE_ADX_RELAX,
         )
 
+    return i1
+
+
+def evaluate_1h_live(state: MarketState, bars_since_last: int = 9999) -> Optional[Signal]:
+    """Evaluate a 1H breakout signal for live trading.
+
+    Mirrors the proven backtest strategy exactly, including all quantitative
+    enhancements.  Called by ``main.on_1h_close`` on every closed 1H bar.
+
+    Args:
+        state: Current :class:`~data_store.MarketState` with live candle buffers.
+        bars_since_last: Number of 1H bars elapsed since the previous trade.
+
+    Returns:
+        A :class:`Signal` if all entry conditions are satisfied, otherwise ``None``.
+    """
+    if state.buf_1h.count < config.MIN_CANDLES_1H:
+        return None
+
+    o1, h1, l1, c1, v1 = state.buf_1h.arrays()
+    i1 = compute_1h_indicators(o1, h1, l1, c1, v1)
     return evaluate_1h_signal(i1, bars_since_last)
+
+
+def diagnose_1h_live(state: MarketState, bars_since_last: int = 9999) -> Optional[SignalDiagnostics]:
+    """Build the entry-funnel diagnostic for the current live 1H bar.
+
+    Rebuilds ``i1`` exactly as :func:`evaluate_1h_live` does (via the shared
+    :func:`compute_1h_indicators`) and renders the funnel.  Called from the
+    main loop's no-signal branch so a quiet bar logs *why* it was quiet.
+
+    Args:
+        state: Current :class:`~data_store.MarketState`.
+        bars_since_last: 1H bars elapsed since the previous trade.
+
+    Returns:
+        A :class:`SignalDiagnostics`, or ``None`` if the buffer is not yet warm.
+    """
+    if state.buf_1h.count < config.MIN_CANDLES_1H:
+        return None
+    o1, h1, l1, c1, v1 = state.buf_1h.arrays()
+    i1 = compute_1h_indicators(o1, h1, l1, c1, v1)
+    return format_signal_diagnostics(i1, bars_since_last)
