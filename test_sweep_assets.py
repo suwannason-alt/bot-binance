@@ -73,6 +73,17 @@ def test_split_by_time_indices_reset():
     assert list(te5.index) == list(range(len(te5)))
 
 
+def test_split_by_time_frac_one_no_crash():
+    # frac=1.0 must not raise IndexError; index clamps to the last bar.
+    df_5m, df_1h = _synthetic_feeds()
+    tr5, tr1, te5, te1 = sa.split_by_time(df_5m, df_1h, frac=1.0)
+    # boundary clamps to the last 1h bar (index 9 → open_time 9*3_600_000),
+    # so exactly the last 1h bar lands in the test window.
+    assert len(te1) == 1
+    assert len(tr1) == 9
+    assert len(tr1) + len(te1) == len(df_1h)
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -81,6 +92,7 @@ TESTS = [
     test_verdict_ruin_overrides_fail,
     test_split_by_time_aligned,
     test_split_by_time_indices_reset,
+    test_split_by_time_frac_one_no_crash,
 ]
 
 

@@ -43,7 +43,8 @@ def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,
 
     Returns ``(train_5m, train_1h, test_5m, test_1h)`` with reset indices.
     """
-    boundary = int(df_1h["open_time"].iloc[int(len(df_1h) * frac)])
+    idx = min(int(len(df_1h) * frac), len(df_1h) - 1)
+    boundary = int(df_1h["open_time"].iloc[idx])
     tr1 = df_1h[df_1h["open_time"] < boundary].reset_index(drop=True)
     te1 = df_1h[df_1h["open_time"] >= boundary].reset_index(drop=True)
     tr5 = df_5m[df_5m["open_time"] < boundary].reset_index(drop=True)
