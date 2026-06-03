@@ -57,6 +57,30 @@ def sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                   reverse=True)
 
 
+def _fmt_pf(pf: float) -> str:
+    return "  inf" if pf == float("inf") else f"{pf:5.2f}"
+
+
+def format_matrix(rows: List[Dict[str, Any]]) -> str:
+    """Render the sorted verdict table as a single console string."""
+    header = (
+        f"{'Asset':<9} {'PF1.15t':>8} {'PF1.10t':>8} {'ΔPF':>7} "
+        f"{'MaxDD1.10t':>11} {'CAGR1.10t':>10} {'Trades':>7} {'VERDICT':>8}"
+    )
+    sep = "-" * len(header)
+    lines = [header, sep]
+    for r in sort_rows(rows):
+        dpf = r["delta_pf"]
+        dpf_s = "    inf" if dpf == float("inf") else f"{dpf:+7.2f}"
+        lines.append(
+            f"{r['symbol']:<9} {_fmt_pf(r['pf_115_test']):>8} "
+            f"{_fmt_pf(r['pf_110_test']):>8} {dpf_s:>7} "
+            f"{r['maxdd_110_test']:>10.1f}% {r['cagr_110_test']:>9.1f}% "
+            f"{r['trades_110_test']:>7d} {r['verdict']:>8}"
+        )
+    return "\n".join(lines)
+
+
 def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,
                   frac: float = SPLIT_FRAC
                   ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:

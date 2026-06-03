@@ -116,6 +116,29 @@ def test_sort_rows_by_delta_then_drawdown():
     assert ordered == ["B", "C", "A"]
 
 
+def test_format_matrix_has_header_and_sorted_rows():
+    rows = [
+        sa.build_row("BTCUSDT", _stats(1.42, -30.0, 50.0, 40, 30),
+                     _stats(1.18, -71.3, 40.0, 60, 50)),   # FAIL+RUIN → RUIN
+        sa.build_row("SOLUSDT", _stats(1.40, -25.0, 80.0, 30, 20),
+                     _stats(1.62, -38.0, 120.0, 50, 30)),  # PASS
+    ]
+    out = sa.format_matrix(rows)
+    assert "Asset" in out and "VERDICT" in out
+    assert "BTCUSDT" in out and "SOLUSDT" in out
+    assert "RUIN" in out and "PASS" in out
+    # SOLUSDT (ΔPF +0.22) must appear before BTCUSDT (ΔPF -0.24)
+    assert out.index("SOLUSDT") < out.index("BTCUSDT")
+
+
+def test_format_matrix_handles_inf_profit_factor():
+    rows = [sa.build_row("ETHUSDT", _stats(1.30, -20.0, 60.0, 25, 15),
+                         _stats(float("inf"), -22.0, 90.0, 40, 0))]
+    out = sa.format_matrix(rows)   # must not raise
+    assert "ETHUSDT" in out
+    assert "inf" in out.lower()
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -127,6 +150,8 @@ TESTS = [
     test_split_by_time_frac_one_no_crash,
     test_build_row_computes_delta_and_verdict,
     test_sort_rows_by_delta_then_drawdown,
+    test_format_matrix_has_header_and_sorted_rows,
+    test_format_matrix_handles_inf_profit_factor,
 ]
 
 
