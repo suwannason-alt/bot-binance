@@ -149,6 +149,8 @@ def test_run_single_sets_config_and_disables_wfo():
         captured["wfo"] = config.WFO_ENABLED
         captured["risk"] = config.RISK_PERCENT
         captured["tp"] = config.ATR_TP_MULTIPLIER
+        captured["sl"] = config.ATR_SL_MULTIPLIER
+        captured["breakout"] = config.BREAKOUT_PERIOD
         captured["mode"] = mode
         return types.SimpleNamespace(stats={"profit_factor": 1.99})
 
@@ -164,6 +166,8 @@ def test_run_single_sets_config_and_disables_wfo():
     assert captured["wfo"] is False
     assert captured["risk"] == 8.0
     assert captured["tp"] == 6.0
+    assert captured["sl"] == 1.5
+    assert captured["breakout"] == 14
     assert captured["mode"] == "1h"
 
 
