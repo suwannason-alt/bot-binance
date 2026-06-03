@@ -84,6 +84,38 @@ def test_split_by_time_frac_one_no_crash():
     assert len(tr1) + len(te1) == len(df_1h)
 
 
+def _stats(pf, dd, cagr, wins, losses):
+    return {"profit_factor": pf, "max_drawdown_pct": dd,
+            "cagr_pct": cagr, "wins": wins, "losses": losses}
+
+
+def test_build_row_computes_delta_and_verdict():
+    row = sa.build_row(
+        symbol="SOLUSDT",
+        s115_test=_stats(1.40, -25.0, 80.0, 30, 20),
+        s110_test=_stats(1.62, -38.0, 120.0, 50, 30),
+    )
+    assert row["symbol"] == "SOLUSDT"
+    assert row["pf_115_test"] == 1.40
+    assert row["pf_110_test"] == 1.62
+    assert abs(row["delta_pf"] - 0.22) < 1e-9
+    assert row["maxdd_110_test"] == -38.0
+    assert row["cagr_110_test"] == 120.0
+    assert row["trades_110_test"] == 80          # wins + losses
+    assert row["verdict"] == "PASS"
+
+
+def test_sort_rows_by_delta_then_drawdown():
+    rows = [
+        {"symbol": "A", "delta_pf": 0.10, "maxdd_110_test": -40.0},
+        {"symbol": "B", "delta_pf": 0.30, "maxdd_110_test": -55.0},
+        {"symbol": "C", "delta_pf": 0.10, "maxdd_110_test": -20.0},
+    ]
+    ordered = [r["symbol"] for r in sa.sort_rows(rows)]
+    # Primary: delta_pf desc → B first. Tie (A,C at 0.10): less-negative DD first → C before A.
+    assert ordered == ["B", "C", "A"]
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -93,6 +125,8 @@ TESTS = [
     test_split_by_time_aligned,
     test_split_by_time_indices_reset,
     test_split_by_time_frac_one_no_crash,
+    test_build_row_computes_delta_and_verdict,
+    test_sort_rows_by_delta_then_drawdown,
 ]
 
 

@@ -10,7 +10,7 @@ Run:  python sweep_assets.py            # full sweep, 5y, default candidates
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
@@ -31,6 +31,30 @@ def verdict(pf_115_test: float, pf_110_test: float,
     if pf_110_test < pf_115_test:
         return "FAIL"
     return "PASS"
+
+
+def build_row(symbol: str, s115_test: Dict[str, Any],
+              s110_test: Dict[str, Any]) -> Dict[str, Any]:
+    """Assemble one result row from the two TEST-window stats dicts."""
+    pf115 = s115_test["profit_factor"]
+    pf110 = s110_test["profit_factor"]
+    dd110 = s110_test["max_drawdown_pct"]
+    return {
+        "symbol":          symbol,
+        "pf_115_test":     pf115,
+        "pf_110_test":     pf110,
+        "delta_pf":        pf110 - pf115,
+        "maxdd_110_test":  dd110,
+        "cagr_110_test":   s110_test["cagr_pct"],
+        "trades_110_test": s110_test["wins"] + s110_test["losses"],
+        "verdict":         verdict(pf115, pf110, dd110),
+    }
+
+
+def sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Sort by ΔPF descending, then by MaxDD (least-negative first)."""
+    return sorted(rows, key=lambda r: (r["delta_pf"], r["maxdd_110_test"]),
+                  reverse=True)
 
 
 def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,
