@@ -206,10 +206,51 @@ def test_parse_args_defaults():
 
 def test_parse_args_overrides():
     args = sa.parse_args(["--days", "730", "--split", "0.6",
-                          "--candidates", "ETHUSDT,SOLUSDT"])
+                          "--candidates", "ETHUSDT,SOLUSDT",
+                          "--ruin-floor", "-30"])
     assert args.days == 730
     assert abs(args.split - 0.6) < 1e-9
     assert args.candidates == ["ETHUSDT", "SOLUSDT"]
+    assert args.ruin_floor == -30.0
+
+
+def test_verdict_custom_floor_overrides_default():
+    # With a looser floor of -99, a -60 drawdown is NOT ruin → PASS.
+    assert sa.verdict(1.0, 1.2, -60.0, ruin_floor=-99.0) == "PASS"
+
+
+def test_build_row_honors_ruin_floor():
+    # -60 drawdown would be RUIN at the -50 default, but PASS at -99 floor.
+    row = sa.build_row("XYZUSDT",
+                       _stats(1.0, -25.0, 50.0, 30, 20),
+                       _stats(1.2, -60.0, 80.0, 40, 20),
+                       ruin_floor=-99.0)
+    assert row["verdict"] == "PASS"
+
+
+def test_evaluate_asset_honors_ruin_floor():
+    df_5m, df_1h = _synthetic_feeds()
+
+    async def fake_fetch_all(symbol="BTCUSDT", days=365):
+        return df_5m, df_1h
+
+    # 1.10 run has a -60 drawdown; 1.15 baseline is benign.
+    def fake_run(d5, d1, initial_balance=1000.0, mode="1h"):
+        if config.ATR_RATIO_MIN == 1.10:
+            return types.SimpleNamespace(stats=_stats(1.7, -60.0, 90.0, 40, 20))
+        return types.SimpleNamespace(stats=_stats(1.4, -25.0, 80.0, 30, 20))
+
+    o_fetch, o_run = fetch_data.fetch_all, backtest.run
+    fetch_data.fetch_all, backtest.run = fake_fetch_all, fake_run
+    try:
+        # Default -50 floor → RUIN; loosened -99 floor → PASS.
+        ruin_row = sa.evaluate_asset("AAAUSDT", days=120, frac=0.7)
+        pass_row = sa.evaluate_asset("BBBUSDT", days=120, frac=0.7, ruin_floor=-99.0)
+    finally:
+        fetch_data.fetch_all, backtest.run = o_fetch, o_run
+
+    assert ruin_row["verdict"] == "RUIN"
+    assert pass_row["verdict"] == "PASS"
 
 
 TESTS = [
@@ -229,6 +270,9 @@ TESTS = [
     test_evaluate_asset_orchestrates_four_runs,
     test_parse_args_defaults,
     test_parse_args_overrides,
+    test_verdict_custom_floor_overrides_default,
+    test_build_row_honors_ruin_floor,
+    test_evaluate_asset_honors_ruin_floor,
 ]
 
 

@@ -44,7 +44,8 @@ def verdict(pf_115_test: float, pf_110_test: float,
 
 
 def build_row(symbol: str, s115_test: Dict[str, Any],
-              s110_test: Dict[str, Any]) -> Dict[str, Any]:
+              s110_test: Dict[str, Any],
+              ruin_floor: float = RUIN_FLOOR) -> Dict[str, Any]:
     """Assemble one result row from the two TEST-window stats dicts."""
     pf115 = s115_test["profit_factor"]
     pf110 = s110_test["profit_factor"]
@@ -57,7 +58,7 @@ def build_row(symbol: str, s115_test: Dict[str, Any],
         "maxdd_110_test":  dd110,
         "cagr_110_test":   s110_test["cagr_pct"],
         "trades_110_test": s110_test["wins"] + s110_test["losses"],
-        "verdict":         verdict(pf115, pf110, dd110),
+        "verdict":         verdict(pf115, pf110, dd110, ruin_floor=ruin_floor),
     }
 
 
@@ -129,7 +130,8 @@ def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,
 
 
 def evaluate_asset(symbol: str, days: int,
-                   frac: float = SPLIT_FRAC) -> Dict[str, Any]:
+                   frac: float = SPLIT_FRAC,
+                   ruin_floor: float = RUIN_FLOOR) -> Dict[str, Any]:
     """Fetch, split, run the 2×2 matrix, and build the result row for one asset.
 
     The train-window runs execute (and surface fetch/data errors early) but only
@@ -142,7 +144,7 @@ def evaluate_asset(symbol: str, days: int,
     run_single(tr5, tr1, atr_ratio=1.10)          # train loose    (context only)
     s115_test = run_single(te5, te1, atr_ratio=1.15)
     s110_test = run_single(te5, te1, atr_ratio=1.10)
-    return build_row(symbol, s115_test, s110_test)
+    return build_row(symbol, s115_test, s110_test, ruin_floor=ruin_floor)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -166,13 +168,12 @@ def parse_args(argv=None) -> argparse.Namespace:
 def main(argv=None) -> int:
     """Run the sweep across all candidates and print the verdict matrix."""
     args = parse_args(argv)
-    global RUIN_FLOOR
-    RUIN_FLOOR = args.ruin_floor
     rows: List[Dict[str, Any]] = []
     for symbol in args.candidates:
         print(f"\n=== {symbol} ===")
         try:
-            rows.append(evaluate_asset(symbol, days=args.days, frac=args.split))
+            rows.append(evaluate_asset(symbol, days=args.days, frac=args.split,
+                                       ruin_floor=args.ruin_floor))
         except Exception as exc:  # noqa: BLE001 — keep sweeping other assets
             print(f"  SKIP {symbol}: {exc}")
     print("\n" + format_matrix(rows))
