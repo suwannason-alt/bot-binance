@@ -14,6 +14,7 @@ import pandas as pd
 
 import backtest
 import config
+import fetch_data
 import sweep_assets as sa
 
 
@@ -171,6 +172,46 @@ def test_run_single_sets_config_and_disables_wfo():
     assert captured["mode"] == "1h"
 
 
+def test_evaluate_asset_orchestrates_four_runs():
+    df_5m, df_1h = _synthetic_feeds()
+
+    async def fake_fetch_all(symbol="BTCUSDT", days=365):
+        return df_5m, df_1h
+
+    # Return PF keyed on the active gate so we can assert wiring.
+    def fake_run(d5, d1, initial_balance=1000.0, mode="1h"):
+        pf = 1.7 if config.ATR_RATIO_MIN == 1.10 else 1.4
+        return types.SimpleNamespace(stats=_stats(pf, -30.0, 90.0, 40, 20))
+
+    o_fetch, o_run = fetch_data.fetch_all, backtest.run
+    fetch_data.fetch_all, backtest.run = fake_fetch_all, fake_run
+    try:
+        row = sa.evaluate_asset("SOLUSDT", days=120, frac=0.7)
+    finally:
+        fetch_data.fetch_all, backtest.run = o_fetch, o_run
+
+    assert row["symbol"] == "SOLUSDT"
+    assert row["pf_115_test"] == 1.4
+    assert row["pf_110_test"] == 1.7
+    assert row["verdict"] == "PASS"
+
+
+def test_parse_args_defaults():
+    args = sa.parse_args([])
+    assert args.days == 1825
+    assert abs(args.split - 0.70) < 1e-9
+    assert args.ruin_floor == -50.0
+    assert args.candidates == sa.DEFAULT_CANDIDATES
+
+
+def test_parse_args_overrides():
+    args = sa.parse_args(["--days", "730", "--split", "0.6",
+                          "--candidates", "ETHUSDT,SOLUSDT"])
+    assert args.days == 730
+    assert abs(args.split - 0.6) < 1e-9
+    assert args.candidates == ["ETHUSDT", "SOLUSDT"]
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -185,6 +226,9 @@ TESTS = [
     test_format_matrix_has_header_and_sorted_rows,
     test_format_matrix_handles_inf_profit_factor,
     test_run_single_sets_config_and_disables_wfo,
+    test_evaluate_asset_orchestrates_four_runs,
+    test_parse_args_defaults,
+    test_parse_args_overrides,
 ]
 
 

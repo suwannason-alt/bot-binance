@@ -10,15 +10,22 @@ Run:  python sweep_assets.py            # full sweep, 5y, default candidates
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
+import sys
 from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
 import backtest
 import config
+import fetch_data
 
 RUIN_FLOOR = -50.0      # MaxDD (%) below this disqualifies an asset
 SPLIT_FRAC = 0.70       # train fraction; remainder is out-of-sample test
+
+DEFAULT_CANDIDATES = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+                      "AVAXUSDT", "LINKUSDT", "NEARUSDT"]
 
 
 def verdict(pf_115_test: float, pf_110_test: float,
@@ -119,3 +126,58 @@ def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,
     tr5 = df_5m[df_5m["open_time"] < boundary].reset_index(drop=True)
     te5 = df_5m[df_5m["open_time"] >= boundary].reset_index(drop=True)
     return tr5, tr1, te5, te1
+
+
+def evaluate_asset(symbol: str, days: int,
+                   frac: float = SPLIT_FRAC) -> Dict[str, Any]:
+    """Fetch, split, run the 2×2 matrix, and build the result row for one asset.
+
+    The train-window runs execute (and surface fetch/data errors early) but only
+    the TEST-window stats drive the verdict, per the spec's out-of-sample rule.
+    """
+    df_5m, df_1h = asyncio.run(fetch_data.fetch_all(symbol=symbol, days=days))
+    tr5, tr1, te5, te1 = split_by_time(df_5m, df_1h, frac)
+
+    run_single(tr5, tr1, atr_ratio=1.15)          # train baseline (context only)
+    run_single(tr5, tr1, atr_ratio=1.10)          # train loose    (context only)
+    s115_test = run_single(te5, te1, atr_ratio=1.15)
+    s110_test = run_single(te5, te1, atr_ratio=1.10)
+    return build_row(symbol, s115_test, s110_test)
+
+
+def parse_args(argv=None) -> argparse.Namespace:
+    """Parse CLI options for the sweep."""
+    p = argparse.ArgumentParser(
+        description="Multi-asset ATR_RATIO 1.10-vs-1.15 out-of-sample sweep.",
+    )
+    p.add_argument("--days", type=int, default=1825,
+                   help="Calendar days of history per asset (default: 1825 = 5y).")
+    p.add_argument("--split", type=float, default=SPLIT_FRAC,
+                   help=f"Train fraction, 0-1 (default: {SPLIT_FRAC}).")
+    p.add_argument("--ruin-floor", dest="ruin_floor", type=float,
+                   default=RUIN_FLOOR,
+                   help=f"MaxDD %% disqualify floor (default: {RUIN_FLOOR}).")
+    p.add_argument("--candidates", type=lambda s: s.split(","),
+                   default=DEFAULT_CANDIDATES,
+                   help="Comma-separated symbols (default: built-in pool).")
+    return p.parse_args(argv)
+
+
+def main(argv=None) -> int:
+    """Run the sweep across all candidates and print the verdict matrix."""
+    args = parse_args(argv)
+    global RUIN_FLOOR
+    RUIN_FLOOR = args.ruin_floor
+    rows: List[Dict[str, Any]] = []
+    for symbol in args.candidates:
+        print(f"\n=== {symbol} ===")
+        try:
+            rows.append(evaluate_asset(symbol, days=args.days, frac=args.split))
+        except Exception as exc:  # noqa: BLE001 — keep sweeping other assets
+            print(f"  SKIP {symbol}: {exc}")
+    print("\n" + format_matrix(rows))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
