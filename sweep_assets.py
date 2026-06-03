@@ -43,18 +43,50 @@ def verdict(pf_115_test: float, pf_110_test: float,
     return "PASS"
 
 
-def build_row(symbol: str, s115_test: Dict[str, Any],
-              s110_test: Dict[str, Any],
+def _has_trades(stats: Dict[str, Any]) -> bool:
+    """A backtest with no trades returns a stats dict lacking these keys."""
+    return "profit_factor" in stats
+
+
+def build_row(symbol: str,
+              s115_train: Dict[str, Any], s110_train: Dict[str, Any],
+              s115_test: Dict[str, Any], s110_test: Dict[str, Any],
               ruin_floor: float = RUIN_FLOOR) -> Dict[str, Any]:
-    """Assemble one result row from the two TEST-window stats dicts."""
+    """Assemble one result row.
+
+    Verdict and ΔPF come from the TEST window only (out-of-sample rule). The
+    1.10 TRAIN profit factor and the train→test ``decay`` (pf_110_test minus
+    pf_110_train; negative ⇒ worse out-of-sample ⇒ overfit) are reported so an
+    overfit asset is visible. A window that produced no trades yields a
+    ``NODATA`` row instead of raising.
+    """
+    pf110_train = s110_train.get("profit_factor")
+
+    if not (_has_trades(s115_test) and _has_trades(s110_test)):
+        return {
+            "symbol":          symbol,
+            "pf_115_test":     s115_test.get("profit_factor"),
+            "pf_110_test":     s110_test.get("profit_factor"),
+            "pf_110_train":    pf110_train,
+            "delta_pf":        None,
+            "decay":           None,
+            "maxdd_110_test":  s110_test.get("max_drawdown_pct"),
+            "cagr_110_test":   s110_test.get("cagr_pct"),
+            "trades_110_test": s110_test.get("wins", 0) + s110_test.get("losses", 0),
+            "verdict":         "NODATA",
+        }
+
     pf115 = s115_test["profit_factor"]
     pf110 = s110_test["profit_factor"]
     dd110 = s110_test["max_drawdown_pct"]
+    decay = (pf110 - pf110_train) if pf110_train is not None else None
     return {
         "symbol":          symbol,
         "pf_115_test":     pf115,
         "pf_110_test":     pf110,
+        "pf_110_train":    pf110_train,
         "delta_pf":        pf110 - pf115,
+        "decay":           decay,
         "maxdd_110_test":  dd110,
         "cagr_110_test":   s110_test["cagr_pct"],
         "trades_110_test": s110_test["wins"] + s110_test["losses"],
@@ -62,31 +94,67 @@ def build_row(symbol: str, s115_test: Dict[str, Any],
     }
 
 
+def _sort_key_num(x: Any) -> float:
+    """Sort helper: None/NaN sink to the bottom under reverse=True."""
+    if isinstance(x, (int, float)) and x == x:   # real number, not NaN
+        return float(x)
+    return float("-inf")
+
+
 def sort_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Sort by ΔPF descending, then by MaxDD (least-negative first)."""
-    return sorted(rows, key=lambda r: (r["delta_pf"], r["maxdd_110_test"]),
-                  reverse=True)
+    """Sort by ΔPF desc, then MaxDD least-negative first. NODATA rows sink last."""
+    return sorted(
+        rows,
+        key=lambda r: (_sort_key_num(r["delta_pf"]), _sort_key_num(r["maxdd_110_test"])),
+        reverse=True,
+    )
 
 
-def _fmt_pf(pf: float) -> str:
-    return "  inf" if pf == float("inf") else f"{pf:5.2f}"
+def _fmt_pf(x: Any) -> str:
+    """Profit-factor cell: dash for None/NaN, 'inf' for infinity, else 2dp."""
+    if x is None or (isinstance(x, float) and x != x):
+        return "—"
+    if x == float("inf"):
+        return "inf"
+    return f"{x:.2f}"
+
+
+def _fmt_delta(x: Any) -> str:
+    """Signed ΔPF / decay cell."""
+    if x is None or (isinstance(x, float) and x != x):
+        return "—"
+    if x == float("inf"):
+        return "inf"
+    return f"{x:+.2f}"
+
+
+def _fmt_pct(x: Any) -> str:
+    """Percentage cell."""
+    if x is None or (isinstance(x, float) and x != x):
+        return "—"
+    return f"{x:.1f}%"
 
 
 def format_matrix(rows: List[Dict[str, Any]]) -> str:
-    """Render the sorted verdict table as a single console string."""
+    """Render the sorted verdict table as a single console string.
+
+    Columns include the 1.10 TRAIN profit factor and the train→test ``Decay`` so
+    overfit assets (strong in-sample, weak out-of-sample) stand out. NODATA rows
+    (a window with no trades) render with dashes and sort to the bottom.
+    """
     header = (
         f"{'Asset':<9} {'PF1.15t':>8} {'PF1.10t':>8} {'ΔPF':>7} "
-        f"{'MaxDD1.10t':>11} {'CAGR1.10t':>10} {'Trades':>7} {'VERDICT':>8}"
+        f"{'PF1.10tr':>9} {'Decay':>7} {'MaxDD1.10t':>11} "
+        f"{'CAGR1.10t':>10} {'Trades':>7} {'VERDICT':>8}"
     )
     sep = "-" * len(header)
     lines = [header, sep]
     for r in sort_rows(rows):
-        dpf = r["delta_pf"]
-        dpf_s = "    inf" if dpf == float("inf") else f"{dpf:+7.2f}"
         lines.append(
             f"{r['symbol']:<9} {_fmt_pf(r['pf_115_test']):>8} "
-            f"{_fmt_pf(r['pf_110_test']):>8} {dpf_s:>7} "
-            f"{r['maxdd_110_test']:>10.1f}% {r['cagr_110_test']:>9.1f}% "
+            f"{_fmt_pf(r['pf_110_test']):>8} {_fmt_delta(r['delta_pf']):>7} "
+            f"{_fmt_pf(r['pf_110_train']):>9} {_fmt_delta(r['decay']):>7} "
+            f"{_fmt_pct(r['maxdd_110_test']):>11} {_fmt_pct(r['cagr_110_test']):>10} "
             f"{r['trades_110_test']:>7d} {r['verdict']:>8}"
         )
     return "\n".join(lines)
@@ -134,17 +202,19 @@ def evaluate_asset(symbol: str, days: int,
                    ruin_floor: float = RUIN_FLOOR) -> Dict[str, Any]:
     """Fetch, split, run the 2×2 matrix, and build the result row for one asset.
 
-    The train-window runs execute (and surface fetch/data errors early) but only
-    the TEST-window stats drive the verdict, per the spec's out-of-sample rule.
+    Runs both gates on the train and test windows. The verdict uses the TEST
+    window only (out-of-sample); the TRAIN 1.10 result is reported so the
+    train→test decay is visible for overfitting detection.
     """
     df_5m, df_1h = asyncio.run(fetch_data.fetch_all(symbol=symbol, days=days))
     tr5, tr1, te5, te1 = split_by_time(df_5m, df_1h, frac)
 
-    run_single(tr5, tr1, atr_ratio=1.15)          # train baseline (context only)
-    run_single(tr5, tr1, atr_ratio=1.10)          # train loose    (context only)
-    s115_test = run_single(te5, te1, atr_ratio=1.15)
-    s110_test = run_single(te5, te1, atr_ratio=1.10)
-    return build_row(symbol, s115_test, s110_test, ruin_floor=ruin_floor)
+    s115_train = run_single(tr5, tr1, atr_ratio=1.15)
+    s110_train = run_single(tr5, tr1, atr_ratio=1.10)
+    s115_test  = run_single(te5, te1, atr_ratio=1.15)
+    s110_test  = run_single(te5, te1, atr_ratio=1.10)
+    return build_row(symbol, s115_train, s110_train, s115_test, s110_test,
+                     ruin_floor=ruin_floor)
 
 
 def parse_args(argv=None) -> argparse.Namespace:

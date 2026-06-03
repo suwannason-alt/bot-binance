@@ -95,6 +95,8 @@ def _stats(pf, dd, cagr, wins, losses):
 def test_build_row_computes_delta_and_verdict():
     row = sa.build_row(
         symbol="SOLUSDT",
+        s115_train=_stats(1.50, -20.0, 70.0, 25, 15),
+        s110_train=_stats(1.80, -30.0, 100.0, 45, 25),
         s115_test=_stats(1.40, -25.0, 80.0, 30, 20),
         s110_test=_stats(1.62, -38.0, 120.0, 50, 30),
     )
@@ -102,9 +104,12 @@ def test_build_row_computes_delta_and_verdict():
     assert row["pf_115_test"] == 1.40
     assert row["pf_110_test"] == 1.62
     assert abs(row["delta_pf"] - 0.22) < 1e-9
+    assert row["pf_110_train"] == 1.80
+    # decay = pf110_test - pf110_train = 1.62 - 1.80 = -0.18 (overfit signal)
+    assert abs(row["decay"] - (-0.18)) < 1e-9
     assert row["maxdd_110_test"] == -38.0
     assert row["cagr_110_test"] == 120.0
-    assert row["trades_110_test"] == 80          # wins + losses
+    assert row["trades_110_test"] == 80
     assert row["verdict"] == "PASS"
 
 
@@ -121,23 +126,26 @@ def test_sort_rows_by_delta_then_drawdown():
 
 def test_format_matrix_has_header_and_sorted_rows():
     rows = [
-        sa.build_row("BTCUSDT", _stats(1.42, -30.0, 50.0, 40, 30),
-                     _stats(1.18, -71.3, 40.0, 60, 50)),   # FAIL+RUIN → RUIN
-        sa.build_row("SOLUSDT", _stats(1.40, -25.0, 80.0, 30, 20),
-                     _stats(1.62, -38.0, 120.0, 50, 30)),  # PASS
+        sa.build_row("BTCUSDT",
+                     _stats(1.40, -20.0, 60.0, 30, 20), _stats(1.20, -40.0, 50.0, 40, 30),
+                     _stats(1.42, -30.0, 50.0, 40, 30), _stats(1.18, -71.3, 40.0, 60, 50)),  # RUIN
+        sa.build_row("SOLUSDT",
+                     _stats(1.50, -20.0, 70.0, 25, 15), _stats(1.70, -25.0, 90.0, 45, 25),
+                     _stats(1.40, -25.0, 80.0, 30, 20), _stats(1.62, -38.0, 120.0, 50, 30)),  # PASS
     ]
     out = sa.format_matrix(rows)
     assert "Asset" in out and "VERDICT" in out
     assert "BTCUSDT" in out and "SOLUSDT" in out
     assert "RUIN" in out and "PASS" in out
-    # SOLUSDT (ΔPF +0.22) must appear before BTCUSDT (ΔPF -0.24)
     assert out.index("SOLUSDT") < out.index("BTCUSDT")
 
 
 def test_format_matrix_handles_inf_profit_factor():
-    rows = [sa.build_row("ETHUSDT", _stats(1.30, -20.0, 60.0, 25, 15),
+    rows = [sa.build_row("ETHUSDT",
+                         _stats(1.20, -15.0, 50.0, 20, 10), _stats(2.0, -18.0, 70.0, 30, 10),
+                         _stats(1.30, -20.0, 60.0, 25, 15),
                          _stats(float("inf"), -22.0, 90.0, 40, 0))]
-    out = sa.format_matrix(rows)   # must not raise
+    out = sa.format_matrix(rows)
     assert "ETHUSDT" in out
     assert "inf" in out.lower()
 
@@ -193,6 +201,8 @@ def test_evaluate_asset_orchestrates_four_runs():
     assert row["symbol"] == "SOLUSDT"
     assert row["pf_115_test"] == 1.4
     assert row["pf_110_test"] == 1.7
+    assert row["pf_110_train"] == 1.7
+    assert row["decay"] == 0.0
     assert row["verdict"] == "PASS"
 
 
@@ -220,10 +230,11 @@ def test_verdict_custom_floor_overrides_default():
 
 
 def test_build_row_honors_ruin_floor():
-    # -60 drawdown would be RUIN at the -50 default, but PASS at -99 floor.
     row = sa.build_row("XYZUSDT",
-                       _stats(1.0, -25.0, 50.0, 30, 20),
-                       _stats(1.2, -60.0, 80.0, 40, 20),
+                       _stats(1.0, -10.0, 40.0, 20, 10),   # s115_train
+                       _stats(1.3, -12.0, 60.0, 30, 10),   # s110_train
+                       _stats(1.0, -25.0, 50.0, 30, 20),   # s115_test
+                       _stats(1.2, -60.0, 80.0, 40, 20),   # s110_test
                        ruin_floor=-99.0)
     assert row["verdict"] == "PASS"
 
@@ -253,6 +264,32 @@ def test_evaluate_asset_honors_ruin_floor():
     assert pass_row["verdict"] == "PASS"
 
 
+def test_build_row_nodata_on_zero_trades():
+    # A zero-trade backtest returns a dict missing profit_factor → NODATA, no crash.
+    row = sa.build_row("NOTRD",
+                       _stats(1.4, -20.0, 60.0, 30, 20),   # train 1.15
+                       _stats(1.6, -25.0, 90.0, 40, 20),   # train 1.10
+                       {},                                  # test 1.15 — no trades
+                       {})                                  # test 1.10 — no trades
+    assert row["verdict"] == "NODATA"
+    assert row["delta_pf"] is None
+
+
+def test_format_matrix_renders_nodata_and_sorts_last():
+    good = sa.build_row("GOODUS",
+                        _stats(1.4, -20.0, 60.0, 30, 20), _stats(1.7, -25.0, 90.0, 45, 25),
+                        _stats(1.4, -25.0, 80.0, 30, 20), _stats(1.7, -30.0, 120.0, 50, 30))
+    nod = sa.build_row("NODAT",
+                       _stats(1.4, -20.0, 60.0, 30, 20), _stats(1.6, -25.0, 90.0, 40, 20),
+                       {}, {})
+    out = sa.format_matrix([nod, good])     # NODATA passed first
+    assert "NODATA" in out
+    assert "—" in out                        # dash for missing numerics
+    assert "PF1.10tr" in out and "Decay" in out
+    # NODATA row must sort to the bottom despite being first in input
+    assert out.index("GOODUS") < out.index("NODAT")
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -273,6 +310,8 @@ TESTS = [
     test_verdict_custom_floor_overrides_default,
     test_build_row_honors_ruin_floor,
     test_evaluate_asset_honors_ruin_floor,
+    test_build_row_nodata_on_zero_trades,
+    test_format_matrix_renders_nodata_and_sorts_last,
 ]
 
 
