@@ -133,15 +133,24 @@ A single console table (**no log files** — standing project preference). One
 row per asset:
 
 ```
-Asset    PF(1.15t)  PF(1.10t)  ΔPF   MaxDD(1.10t)  CAGR(1.10t)  Trades  VERDICT
-BTCUSDT     1.42      1.18    -0.24     -71.3%        +XX%        NNN     RUIN
-SOLUSDT     1.55      1.71    +0.16     -38.0%        +XX%        NNN     PASS
-...
+Asset    PF1.15t  PF1.10t   ΔPF  PF1.10tr  Decay  MaxDD1.10t  CAGR1.10t  Trades  VERDICT
+BTCUSDT     0.97     1.93 +0.96     2.56  -0.63      -25.7%     181.6%      11     PASS
+SOLUSDT     1.55     1.71 +0.16     1.74  -0.03      -38.0%      ...        NNN     PASS
 ```
 
+All metric columns describe the **test** window except `PF1.10tr` (the 1.10
+profit factor on the **train** window) and `Decay`. **`Decay = PF1.10t −
+PF1.10tr`** — the train→test change in the 1.10 profit factor. A large negative
+`Decay` flags an asset that looked strong in-sample but degraded out-of-sample
+(overfit), per the anti-overfitting purpose in §2 and §4.3; it is informational
+and does **not** alter the verdict (which remains test-window-only).
+
 Sorted by `ΔPF` descending, then by `MaxDD` (least-negative first). Column
-values are pulled directly from `BacktestResult.stats`. The control row
-(`BTCUSDT`) is always included to anchor interpretation.
+values are pulled directly from `BacktestResult.stats`. A window that produced
+**no trades** returns a stats dict without the metric keys; such rows render
+with `—` placeholders, carry the verdict **`NODATA`**, and sort to the bottom
+rather than crashing the sweep. The control row (`BTCUSDT`) is always included
+to anchor interpretation.
 
 ---
 
