@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Tuple
 
 import pandas as pd
 
+import backtest
+import config
+
 RUIN_FLOOR = -50.0      # MaxDD (%) below this disqualifies an asset
 SPLIT_FRAC = 0.70       # train fraction; remainder is out-of-sample test
 
@@ -79,6 +82,24 @@ def format_matrix(rows: List[Dict[str, Any]]) -> str:
             f"{r['trades_110_test']:>7d} {r['verdict']:>8}"
         )
     return "\n".join(lines)
+
+
+def run_single(df_5m: pd.DataFrame, df_1h: pd.DataFrame, atr_ratio: float,
+               initial_balance: float = 1000.0) -> Dict[str, Any]:
+    """Apply the fixed sweep config + the given gate, run one backtest.
+
+    Holds RISK=8, TP=6.0, SL=1.5, BREAKOUT=14 constant and forces WFO OFF so
+    the experiment isolates ATR_RATIO_MIN. Returns ``BacktestResult.stats``.
+    """
+    config.ATR_RATIO_MIN     = atr_ratio
+    config.RISK_PERCENT      = 8.0
+    config.ATR_TP_MULTIPLIER = 6.0
+    config.ATR_SL_MULTIPLIER = 1.5
+    config.BREAKOUT_PERIOD   = 14
+    config.WFO_ENABLED       = False
+    result = backtest.run(df_5m, df_1h, initial_balance=initial_balance,
+                          mode="1h")
+    return result.stats
 
 
 def split_by_time(df_5m: pd.DataFrame, df_1h: pd.DataFrame,

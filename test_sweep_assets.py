@@ -12,6 +12,8 @@ import types
 import numpy as np
 import pandas as pd
 
+import backtest
+import config
 import sweep_assets as sa
 
 
@@ -139,6 +141,32 @@ def test_format_matrix_handles_inf_profit_factor():
     assert "inf" in out.lower()
 
 
+def test_run_single_sets_config_and_disables_wfo():
+    captured = {}
+
+    def fake_run(df_5m, df_1h, initial_balance=1000.0, mode="1h"):
+        captured["atr_ratio"] = config.ATR_RATIO_MIN
+        captured["wfo"] = config.WFO_ENABLED
+        captured["risk"] = config.RISK_PERCENT
+        captured["tp"] = config.ATR_TP_MULTIPLIER
+        captured["mode"] = mode
+        return types.SimpleNamespace(stats={"profit_factor": 1.99})
+
+    orig = backtest.run
+    backtest.run = fake_run
+    try:
+        stats = sa.run_single(pd.DataFrame(), pd.DataFrame(), atr_ratio=1.10)
+    finally:
+        backtest.run = orig
+
+    assert stats == {"profit_factor": 1.99}
+    assert captured["atr_ratio"] == 1.10
+    assert captured["wfo"] is False
+    assert captured["risk"] == 8.0
+    assert captured["tp"] == 6.0
+    assert captured["mode"] == "1h"
+
+
 TESTS = [
     test_verdict_pass,
     test_verdict_equal_is_pass,
@@ -152,6 +180,7 @@ TESTS = [
     test_sort_rows_by_delta_then_drawdown,
     test_format_matrix_has_header_and_sorted_rows,
     test_format_matrix_handles_inf_profit_factor,
+    test_run_single_sets_config_and_disables_wfo,
 ]
 
 
