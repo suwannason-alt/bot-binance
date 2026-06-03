@@ -616,6 +616,56 @@ python run_backtest.py --help
 python verify_warmup.py
 ```
 
+### Multi-asset ATR_RATIO sweep (`sweep_assets.py`)
+
+Offline research tool that screens crypto perpetuals for compatibility with the
+loose `ATR_RATIO_MIN = 1.10` volatility gate. The `1.10` gate yields higher CAGR
+than the proven `1.15` but ruins BTC on choppy years; this sweep finds assets
+where it survives — using a method that does **not** manufacture false winners
+by picking the best in-sample backtest.
+
+For each candidate it splits history **70/30 by time** and runs a 2×2 matrix
+(`{1.10, 1.15} × {train, test}`) with `RISK=8%`, `TP=6.0`, `SL=1.5`, `BREAKOUT=14`,
+**WFO off** (to isolate `ATR_RATIO`). The verdict uses the **test** window only:
+
+- **PASS** — `1.10` test profit factor ≥ the `1.15` baseline, and MaxDD stays
+  above the ruin floor.
+- **FAIL** — `1.10` degrades vs `1.15` out-of-sample.
+- **RUIN** — `1.10` test MaxDD breaches the floor (default −50%); overrides all.
+- **NODATA** — a window produced no trades; row renders with `—` and sorts last.
+
+The `Decay` column (`PF1.10test − PF1.10train`) exposes overfitting: a large
+negative value means the gate looked strong in-sample but fell apart
+out-of-sample. Sorted by ΔPF, then MaxDD. Console-only output, no log files.
+
+```bash
+# Full 5-year sweep across the default candidate pool (BTC included as control)
+python sweep_assets.py
+
+# Faster screen on a shorter window
+python sweep_assets.py --days 730
+
+# Specific pairs only
+python sweep_assets.py --candidates ETHUSDT,SOLUSDT,AVAXUSDT
+
+# Custom split / ruin floor
+python sweep_assets.py --split 0.6 --ruin-floor -40
+
+# Show all flags
+python sweep_assets.py --help
+```
+
+> **Heads-up:** uses live Binance fetch + the `data/` cache. A cold full
+> 5m+1h fetch for the whole pool is millions of bars — expect tens of minutes
+> the first time; cached re-runs are fast. Default pool: `BTCUSDT, ETHUSDT,
+> SOLUSDT, BNBUSDT, AVAXUSDT, LINKUSDT, NEARUSDT`.
+
+Run the tool's unit tests (standalone, no pytest required):
+
+```bash
+python test_sweep_assets.py
+```
+
 ---
 
 ## 9. Safety Measures & Emergency Kill Switch
@@ -731,6 +781,8 @@ trading-bot/
 │
 ├── backtest.py              Vectorised backtesting engine
 ├── run_backtest.py          Single-call autonomous runner (WFO on, 6-year default)
+├── sweep_assets.py          Multi-asset ATR_RATIO 1.10-vs-1.15 out-of-sample sweep
+├── test_sweep_assets.py     Standalone unit tests for sweep_assets.py (no pytest)
 ├── visualize.py             Equity curve + trade marker charts
 ├── verify_warmup.py         Warmup diagnostic — checks indicator seeding & no-lookahead
 │
