@@ -61,7 +61,7 @@ logger = logging.getLogger("run_backtest")
 # years (Sep 2019 → Sep 2025); YEARS=7 includes the partial 7th year.
 # Setting YEARS=8 creates a phantom Year 8 (no data) — avoid.
 INITIAL_BALANCE: float = 1_000.0
-YEARS:           int   = 6
+YEARS:           int   = 1
 DAYS:            int   = YEARS * 365
 
 # ── Goal thresholds (period-invariant) ────────────────────────────────────────

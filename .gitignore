@@ -8,7 +8,9 @@
 .env.*
 !.env.example        # keep the template
 
-
+data
+docs
+.claude
 # ── Bot runtime state ────────────────────────────────────────────────────────
 bot_state.db
 bot_state.db-wal
