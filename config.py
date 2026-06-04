@@ -83,7 +83,7 @@ BOT_STATE_DB_PATH = os.getenv(
 )
 
 WS_URL = (
-    "wss://fstream.binance.com/stream?streams="
+    "wss://fstream.binance.com/market/stream?streams="
     f"{SYMBOL.lower()}@kline_5m/"
     f"{SYMBOL.lower()}@kline_1h/"
     f"{SYMBOL.lower()}@markPrice/"
