@@ -129,6 +129,20 @@ async def on_1h_close(mstate: MarketState) -> None:
     _bars_since_last_1h += 1
     _bar_counter         += 1
 
+    # ── 0. Per-close marker ───────────────────────────────────────────────────
+    # Unconditional proof that this handler ran for this bar, before any gate or
+    # early-return. NOTE: this only fires once the WS actually delivers a closed
+    # 1H frame — if the stream is silent, the blocker is upstream in ws_client,
+    # not here (a silent socket emits no heartbeat from on_tick either).
+    try:
+        _c1_close = float(mstate.buf_1h.arrays()[3][-1]) if mstate.buf_1h.count else float("nan")
+    except (IndexError, ValueError):
+        _c1_close = float("nan")
+    logger.info(
+        "1H close #%d  close=%.2f  buf_1h=%d  bars_since=%d",
+        _bar_counter, _c1_close, mstate.buf_1h.count, _bars_since_last_1h,
+    )
+
     # ── 1. Append the just-closed candle to LiveHistory ───────────────────────
     if _live_history is not None and mstate.buf_1h.count > 0:
         # Single arrays() call — previous code called it twice (bug: 10 allocs not 5)

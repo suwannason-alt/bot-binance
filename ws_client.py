@@ -58,6 +58,11 @@ class BinanceWS:
         self.on_1h_close = on_1h_close
         self.on_tick = on_tick
         self._running = False
+        # ── Stream-flow instrumentation ──────────────────────────────────────
+        # Counts every frame received on the socket so we can prove whether the
+        # `async for` loop is actually delivering data (vs. a connected-but-silent
+        # socket).  Logged once on the first frame, then throttled thereafter.
+        self._msg_count = 0
 
     async def run(self) -> None:
         """Start the WebSocket event loop, reconnecting on any error.
@@ -106,7 +111,19 @@ class BinanceWS:
         try:
             msg = json.loads(raw_message)
         except json.JSONDecodeError:
+            logger.warning("WS frame dropped — not valid JSON: %.120s", raw_message)
             return
+
+        # ── Stream-flow proof ─────────────────────────────────────────────────
+        # The first frame proves the socket is delivering data (not just
+        # connected). After that, log a throttled heartbeat so a healthy stream
+        # is visibly alive without flooding the log.
+        self._msg_count += 1
+        if self._msg_count == 1:
+            logger.info("WS stream live — first frame received (stream=%s)",
+                        msg.get("stream", "<none>"))
+        elif self._msg_count % 1000 == 0:
+            logger.info("WS stream flowing — %d frames received", self._msg_count)
 
         stream: str = msg.get("stream", "")
         data: dict = msg.get("data", {})
@@ -133,3 +150,12 @@ class BinanceWS:
 
         elif "@aggTrade" in stream:
             self.state.update_agg_trade(data)
+
+        else:
+            # No matching stream branch. This catches Binance control frames
+            # (subscription acks `{"result":null,"id":..}`, `{"error":..}`) and
+            # any unexpected stream name — all of which were previously dropped
+            # silently. Surfacing them is the difference between "messages arrive
+            # but never dispatch" and "no messages arrive at all".
+            logger.warning("WS frame not dispatched — stream=%r  payload=%.160s",
+                           stream or "<none>", raw_message)
