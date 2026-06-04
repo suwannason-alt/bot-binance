@@ -5,7 +5,17 @@
       "Bash(python *)",
       "Bash(tee /tmp/backtest_6yr_v2.txt)",
       "Bash(echo \"Exit: $?\")",
-      "Bash(tee /tmp/backtest_7yr.txt)"
+      "Bash(tee /tmp/backtest_7yr.txt)",
+      "Bash(git checkout *)",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'docs: 📝 multi-asset ATR_RATIO sweep design spec *)",
+      "Bash(sed -n '472,495p' backtest.py)",
+      "Bash(sed -n '60,75p' backtest.py)",
+      "Bash(sed -n '1238,1265p' backtest.py)",
+      "Bash(git commit -q -m 'docs: 📋 multi-asset ATR sweep implementation plan *)",
+      "Bash(git commit *)",
+      "Bash(echo Exit code: $? *)",
+      "Bash(git *)"
     ]
   }
 }

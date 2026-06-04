@@ -61,7 +61,7 @@ logger = logging.getLogger("run_backtest")
 # years (Sep 2019 → Sep 2025); YEARS=7 includes the partial 7th year.
 # Setting YEARS=8 creates a phantom Year 8 (no data) — avoid.
 INITIAL_BALANCE: float = 1_000.0
-YEARS:           int   = 1
+YEARS:           int   = 6
 DAYS:            int   = YEARS * 365
 
 # ── Goal thresholds (period-invariant) ────────────────────────────────────────
@@ -96,7 +96,7 @@ _BASE: Dict = {
     "TRAIL_ACTIVATE_ATR":      1.5,
     "TRAIL_LOCK_ATR":          0.0,
     "TRAIL_STOP_ATR":          0.0,
-    "ATR_RATIO_MIN":           1.15,
+    "ATR_RATIO_MIN":           1.10,
     "EMA_SLOPE_MIN_PCT":       0.15,
     "VOL_RATIO_MIN":           0.3,
     "ATR_1H_PCT_MIN":          0.05,
