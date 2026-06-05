@@ -79,22 +79,23 @@ SYMBOL_PROFILES: dict[str, dict] = {
     # XAUUSDT — gold perpetual (onboarded 2025-12-11).  Finer price tick (0.01),
     # same 0.001 oz lot, $5 min notional.
     #
-    # The "strategy" block makes this an AGGRESSIVE, high-frequency gold profile —
-    # grid-searched on the only ~6 months of gold history (one continuous bull run,
-    # $4.2k→$5.6k).  Full-window WFO backtest, production sizing: +48% / ~6 mo,
-    # PF 1.46, MaxDD −37%, 28 trades.  ⚠️ OVERFIT to a single bull regime (adjacent
-    # settings turn negative); chosen deliberately for max absolute return / trade
-    # frequency at ~2× the drawdown of the default.  See README §4 "Trading XAUUSDT".
-    # These params apply ONLY when SYMBOL=XAUUSDT; BTC and every other symbol keep
-    # the proven defaults below.
+    # The "strategy" block runs the CONSERVATIVE profile — identical to the proven
+    # BTC filters, the best risk-adjusted config on the only ~6 months of gold
+    # history.  Full-window WFO backtest, production sizing: +39% / ~6 mo, PF 2.10,
+    # MaxDD −18%, 9 trades.  (An aggressive alt — TP=8, ADX≥25, ATR_RATIO_MIN=1.10,
+    # EMA_SLOPE_MIN_PCT=0.0 — yields +48% but at PF 1.46 / MaxDD −37% / 28 trades and
+    # is overfit to the single bull run.  See README §4.)  The values are stated
+    # explicitly (rather than omitting the block) so the live path and the
+    # run_backtest overlay stay in sync at ATR_RATIO_MIN=1.15.  These params apply
+    # ONLY when SYMBOL=XAUUSDT; BTC and every other symbol use the same defaults.
     "XAUUSDT": {
         "min_order_qty": 0.001, "qty_step": 0.001, "price_tick": 0.01, "min_notional": 5.0,
         "strategy": {
-            "ATR_RATIO_MIN":     1.10,   # wider entry gate (vs 1.15) — gold expands less
-            "ADX_MIN":           25.0,   # demand a strong trend before entering
-            "EMA_SLOPE_MIN_PCT": 0.0,    # off — allow shorter-term momentum entries
-            "ATR_TP_MULTIPLIER": 8.0,    # let winners run further in gold's smooth trends
-            "ATR_SL_MULTIPLIER": 1.5,    # unchanged — same stop distance as proven config
+            "ATR_RATIO_MIN":     1.15,   # proven volatility-expansion gate
+            "ADX_MIN":           20.0,   # proven trend-strength floor
+            "EMA_SLOPE_MIN_PCT": 0.15,   # proven EMA200 slope filter (blocks flat markets)
+            "ATR_TP_MULTIPLIER": 6.0,    # proven 4:1 RR take-profit
+            "ATR_SL_MULTIPLIER": 1.5,    # proven stop distance
         },
     },
 }

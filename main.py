@@ -605,7 +605,7 @@ async def main() -> None:
 
     loop = asyncio.get_running_loop()
 
-    def _shutdown(sig):
+    def _shutdown(sig: signal.Signals) -> None:
         logger.info(f"Received {sig.name} — shutting down…")
         ws.stop()
         for task in asyncio.all_tasks(loop):

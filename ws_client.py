@@ -28,6 +28,13 @@ logger = logging.getLogger("ws_client")
 # Seconds to wait before reconnecting after a connection error
 _RECONNECT_DELAY: int = 5
 
+# WebSocket keep-alive / shutdown timeouts (seconds).  Binance closes idle
+# sockets aggressively, so a 20 s ping cadence keeps the connection proven-live;
+# close_timeout bounds how long a graceful close may block on reconnect.
+_WS_PING_INTERVAL: int = 20
+_WS_PING_TIMEOUT: int = 20
+_WS_CLOSE_TIMEOUT: int = 10
+
 # Type alias for async callbacks
 _AsyncCallback = Callable[..., Coroutine[Any, Any, None]]
 
@@ -94,9 +101,9 @@ class BinanceWS:
         logger.info(f"Connecting to {config.WS_URL}")
         async with websockets.connect(
             config.WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
-            close_timeout=10,
+            ping_interval=_WS_PING_INTERVAL,
+            ping_timeout=_WS_PING_TIMEOUT,
+            close_timeout=_WS_CLOSE_TIMEOUT,
         ) as ws:
             logger.info("WebSocket connected")
             async for raw_message in ws:

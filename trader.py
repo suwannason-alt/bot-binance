@@ -13,7 +13,7 @@ import logging
 import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import config
 from strategy import Signal, position_size_usdt
@@ -81,7 +81,7 @@ class Trader:
         consecutive_losses: Count of consecutive stop-loss exits (resets daily).
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.position: Optional[Position] = None
         self.balance: float = 1000.0  # paper balance; overwritten on live init
         self.trade_log: list[Position] = []
@@ -415,7 +415,7 @@ class Trader:
             return await self._place_limit_entry(signal, qty)
         return await self._place_market_entry(signal, qty)
 
-    async def _set_leverage_safe(self, sym: str):
+    async def _set_leverage_safe(self, sym: str) -> None:
         """Set leverage; swallow repeated-call errors from the exchange."""
         loop = asyncio.get_event_loop()
         try:
@@ -894,7 +894,7 @@ class Trader:
         except Exception as e:
             logger.error(f"[LIVE] Failed to update SL order on trail: {e}")
 
-    def stats(self) -> Dict:
+    def stats(self) -> Dict[str, Any]:
         """Return a summary statistics dictionary for the current session.
 
         Returns:
