@@ -297,42 +297,59 @@ contract, so you do **not** hand-set them:
 > `MIN_NOTIONAL` guard (default `$5`) also skips orders too small for the
 > contract — relevant for tiny accounts, since `0.001 oz × $4,400 ≈ $4.40 < $5`.
 
-**Strategy parameters: gold runs an AGGRESSIVE, high-frequency profile.** Unlike
-BTC's filters, the gold strategy params live in
-`SYMBOL_PROFILES["XAUUSDT"]["strategy"]` and apply automatically when
-`SYMBOL=XAUUSDT` (they are **not** read from `.env`). The active gold matrix:
+**Strategy parameters are profile-driven, not `.env`-driven.** Unlike sizing/risk
+settings, the gold strategy params live in `SYMBOL_PROFILES["XAUUSDT"]["strategy"]`
+in `config.py` and apply automatically when `SYMBOL=XAUUSDT` — they are **not** read
+from `.env` (setting them there has no effect). Gold ships the **conservative
+profile**, identical to the proven BTC filters:
 
-| Param | BTC (default) | XAUUSDT (gold profile) |
-|-------|:-------------:|:----------------------:|
-| `ATR_TP_MULTIPLIER` | 6.0 | **8.0** |
-| `ATR_SL_MULTIPLIER` | 1.5 | 1.5 |
-| `ADX_MIN` | 20.0 | **25.0** |
-| `ATR_RATIO_MIN` | 1.15 | **1.10** |
-| `EMA_SLOPE_MIN_PCT` | 0.15 | **0.0** |
-
-> ⚠️ **This profile is deliberately overfit.** XAUUSDT onboarded **2025-12-11**,
-> so only ~6 months of history exist — one continuous bull run ($4,200 → $5,570),
-> no bear/sustained-chop regime, almost no short-side data. A 70/30 train/test
-> sweep leaves only 1–9 trades in the test window, so these params are fit to a
-> single bull market and **may not generalize when gold ranges or falls**. They
-> were chosen for **maximum absolute return and trade frequency**, accepting a
-> deeper drawdown. WFO still adapts `BREAKOUT_PERIOD` live. Re-evaluate after gold
-> sees a full down-cycle; to revert to the conservative profile, edit the
-> `strategy` block in `config.py`.
+| Param | BTC default | XAUUSDT (active: conservative) | Aggressive alt |
+|-------|:-----------:|:------------------------------:|:--------------:|
+| `ATR_TP_MULTIPLIER` | 6.0 | **6.0** | 8.0 |
+| `ATR_SL_MULTIPLIER` | 1.5 | **1.5** | 1.5 |
+| `ADX_MIN` | 20.0 | **20.0** | 25.0 |
+| `ATR_RATIO_MIN` | 1.15 | **1.15** | 1.10 |
+| `EMA_SLOPE_MIN_PCT` | 0.15 | **0.15** | 0.0 |
 
 Full-window WFO backtest on all ~6 months of gold, production sizing
 (`EQUITY_PERCENT=0`, `RISK_PERCENT=8%`):
 
 | Profile | Return (6 mo) | PF | MaxDD | Trades | Status |
 |---------|--------------:|---:|------:|-------:|--------|
-| **Aggressive** (`ATR_RATIO_MIN=1.10`, `EMA_SLOPE_MIN_PCT=0`, `ADX≥25`, `TP=8`) | **+48%** | 1.46 | **−37%** | 28 | **Active gold default** — max return / frequency. |
-| Conservative (`ATR_RATIO_MIN=1.15`, `EMA_SLOPE_MIN_PCT=0.15`, `TP=6`) | +39% | 2.10 | −18% | 9 | Best risk-adjusted; safer fallback. |
+| **Conservative** (`ATR_RATIO_MIN=1.15`, `EMA_SLOPE_MIN_PCT=0.15`, `TP=6`) | +39% | **2.10** | **−18%** | 9 | **Active gold default** — best risk-adjusted. |
+| Aggressive (`ATR_RATIO_MIN=1.10`, `EMA_SLOPE_MIN_PCT=0`, `ADX≥25`, `TP=8`) | **+48%** | 1.46 | −37% | 28 | Higher raw return, 2× drawdown; overfit (opt-in). |
 
-```bash
-# Validate on the gold feed before going live
-python run_backtest.py --symbol XAUUSDT --days 176     # full available history
-SYMBOL=XAUUSDT python main.py                          # paper/live per PAPER_TRADING
-```
+> ⚠️ **Both profiles are fit to a single bull regime.** XAUUSDT onboarded
+> **2025-12-11**, so only ~6 months of history exist — one continuous bull run
+> ($4,200 → $5,570), no bear/sustained-chop regime, almost no short-side data
+> (n = 9–28 trades). These numbers reflect "long gold in an uptrend," **not a
+> validated edge**, and may not generalize when gold ranges or falls. WFO still
+> adapts `BREAKOUT_PERIOD` live. Re-evaluate after gold sees a full down-cycle.
+> To switch profiles, edit the `strategy` block in `config.py` (the aggressive
+> matrix is preserved in that block's comment).
+
+**Deploy checklist (XAUUSDT):**
+
+1. **Use the gold template** — copy [`.env.xauusdt.example`](.env.xauusdt.example)
+   to `.env`. It sets `SYMBOL=XAUUSDT`, production sizing (`EQUITY_PERCENT=0`,
+   `RISK_PERCENT=8`, `LEVERAGE=10`), `PAPER_TRADING=true`, and deliberately omits
+   the precision keys so the profile's gold values (`PRICE_TICK=0.01`, …) apply.
+   > ⚠️ Do **not** pin `PRICE_TICK` / `QTY_STEP` / `MIN_ORDER_QTY` — an explicit
+   > env value overrides the profile, and BTC's `PRICE_TICK=0.10` would get every
+   > gold order rejected. The `MIN_NOTIONAL=$5` guard also skips sub-$5 orders.
+2. **Backtest the gold feed** to confirm data + config resolve:
+   ```bash
+   python run_backtest.py --symbol XAUUSDT --days 176     # all available history
+   ```
+   Expect the conservative result: **+39% / PF 2.10 / MaxDD −18% / 9 trades**.
+3. **Paper-trade first.** The live gold order path (`SYMBOL_CCXT=XAU/USDT`, the WS
+   streams) has not been exercised against the exchange — run paper to confirm the
+   CCXT symbol resolves and the feed connects before risking capital:
+   ```bash
+   SYMBOL=XAUUSDT python main.py                          # PAPER_TRADING=true
+   ```
+4. **Go live** only after paper looks correct: set real `BINANCE_API_KEY` /
+   `BINANCE_API_SECRET` and `PAPER_TRADING=false` in `.env`, then restart.
 
 ---
 
