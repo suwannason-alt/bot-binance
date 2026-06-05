@@ -66,6 +66,43 @@ if not PAPER_TRADING:
 SYMBOL      = os.getenv("SYMBOL", "BTCUSDT")
 SYMBOL_CCXT = f"{SYMBOL[:3]}/{SYMBOL[3:]}"
 
+# ── Per-symbol exchange profiles ──────────────────────────────────────────────
+# Binance USDT-M Futures lot/price/notional rules differ per contract.  Using the
+# wrong PRICE_TICK or QTY_STEP gets orders rejected outright.  The active profile
+# (keyed by SYMBOL) supplies the *defaults* for MIN_ORDER_QTY / QTY_STEP /
+# PRICE_TICK / MIN_NOTIONAL below; each is still individually env-overridable.
+# Source: GET /fapi/v1/exchangeInfo  (LOT_SIZE, PRICE_FILTER, MIN_NOTIONAL).
+SYMBOL_PROFILES: dict[str, dict] = {
+    # BTCUSDT — the historical default; precision unchanged from the legacy
+    # hard-codes, and NO "strategy" block → uses the proven defaults defined below.
+    "BTCUSDT": {"min_order_qty": 0.001, "qty_step": 0.001, "price_tick": 0.10, "min_notional": 5.0},
+    # XAUUSDT — gold perpetual (onboarded 2025-12-11).  Finer price tick (0.01),
+    # same 0.001 oz lot, $5 min notional.
+    #
+    # The "strategy" block makes this an AGGRESSIVE, high-frequency gold profile —
+    # grid-searched on the only ~6 months of gold history (one continuous bull run,
+    # $4.2k→$5.6k).  Full-window WFO backtest, production sizing: +48% / ~6 mo,
+    # PF 1.46, MaxDD −37%, 28 trades.  ⚠️ OVERFIT to a single bull regime (adjacent
+    # settings turn negative); chosen deliberately for max absolute return / trade
+    # frequency at ~2× the drawdown of the default.  See README §4 "Trading XAUUSDT".
+    # These params apply ONLY when SYMBOL=XAUUSDT; BTC and every other symbol keep
+    # the proven defaults below.
+    "XAUUSDT": {
+        "min_order_qty": 0.001, "qty_step": 0.001, "price_tick": 0.01, "min_notional": 5.0,
+        "strategy": {
+            "ATR_RATIO_MIN":     1.10,   # wider entry gate (vs 1.15) — gold expands less
+            "ADX_MIN":           25.0,   # demand a strong trend before entering
+            "EMA_SLOPE_MIN_PCT": 0.0,    # off — allow shorter-term momentum entries
+            "ATR_TP_MULTIPLIER": 8.0,    # let winners run further in gold's smooth trends
+            "ATR_SL_MULTIPLIER": 1.5,    # unchanged — same stop distance as proven config
+        },
+    },
+}
+# Fall back to the BTC profile for any unlisted symbol (preserves legacy behaviour).
+_SYMBOL_PROFILE = SYMBOL_PROFILES.get(SYMBOL, SYMBOL_PROFILES["BTCUSDT"])
+# Per-symbol strategy overrides (empty for BTC / unlisted → proven defaults stand).
+_STRAT = _SYMBOL_PROFILE.get("strategy", {})
+
 # ── Telegram notifications ────────────────────────────────────────────────────
 # Leave TELEGRAM_BOT_TOKEN empty to disable all Telegram alerts.
 # Alert level mirrors Python logging levels: DEBUG/INFO/WARNING/ERROR/CRITICAL.
@@ -99,9 +136,10 @@ LEVERAGE          = int(os.getenv("LEVERAGE", "10"))           # futures leverag
 # qty = (ORDER_BALANCE_USD × LEVERAGE) / entry_price
 ORDER_BALANCE_USD = float(os.getenv("ORDER_BALANCE_USD", "0.0"))
 
-# SL / TP as multiples of ATR
-ATR_SL_MULTIPLIER = 1.5
-ATR_TP_MULTIPLIER = 6.0   # 4:1 RR → break-even ~20% win rate; proven 5yr all-pass config
+# SL / TP as multiples of ATR.  Defaults are the proven BTC values; the active
+# SYMBOL_PROFILE's "strategy" block may override them per-symbol (see XAUUSDT).
+ATR_SL_MULTIPLIER = float(_STRAT.get("ATR_SL_MULTIPLIER", 1.5))
+ATR_TP_MULTIPLIER = float(_STRAT.get("ATR_TP_MULTIPLIER", 6.0))   # 4:1 RR → break-even ~20% win rate; proven 5yr all-pass config
 
 # ── Warm-up periods ───────────────────────────────────────────────────────────
 MIN_CANDLES_5M = int(os.getenv("MIN_CANDLES_5M", "60"))
@@ -141,10 +179,12 @@ REQUIRE_MACD_CONFIRM = False   # if True, breakout also requires MACD hist direc
 
 # ── Regime / trend-strength filters ──────────────────────────────────────────
 # Both filters guard against trading in flat/choppy markets (no directional trend).
-EMA_SLOPE_MIN_PCT = 0.15   # EMA200 must have moved ≥ 0.15% over EMA_TREND_SLOPE_BARS (0=off)
-ATR_RATIO_MIN     = 1.15   # current ATR must be ≥ 1.15× its 20-bar SMA — expanding volatility
+# The three trend/vol-strength thresholds below default to the proven BTC values
+# and may be overridden per-symbol by the active SYMBOL_PROFILE "strategy" block.
+EMA_SLOPE_MIN_PCT = float(_STRAT.get("EMA_SLOPE_MIN_PCT", 0.15))  # EMA200 must have moved ≥ X% over EMA_TREND_SLOPE_BARS (0=off)
+ATR_RATIO_MIN     = float(_STRAT.get("ATR_RATIO_MIN", 1.15))      # current ATR must be ≥ X× its 20-bar SMA — expanding volatility
 ADX_PERIOD        = 14     # ADX lookback period
-ADX_MIN           = 20.0   # require ADX ≥ 20 to trade; blocks choppy/ranging markets
+ADX_MIN           = float(_STRAT.get("ADX_MIN", 20.0))            # require ADX ≥ X to trade; blocks choppy/ranging markets
 # EMA200 distance filter: require price to be at least X% away from EMA200.
 # In choppy 2023, BTC oscillated within 0-2% of EMA200 → filter blocks near-EMA noise.
 # In sustained 2024+ bull, price was 10-30% above EMA200 → does not filter.
@@ -204,11 +244,17 @@ SLIPPAGE    = 0.0002       # 0.02% market impact per fill
 # Binance pays/charges funding every 8 h. At 0.10 %/8 h you pay ~11 % APR just for holding.
 FUNDING_RATE_MAX   = float(os.getenv("FUNDING_RATE_MAX", "0.001"))  # 0.10 %/8h (0 = off)
 
-# BTC/USDT Futures minimum order size and precision (Binance exchange rules).
-# Orders below MIN_ORDER_QTY or with wrong precision are rejected outright.
-MIN_ORDER_QTY      = float(os.getenv("MIN_ORDER_QTY", "0.001"))     # BTC min lot size
-QTY_STEP           = float(os.getenv("QTY_STEP",      "0.001"))     # BTC quantity step
-PRICE_TICK         = float(os.getenv("PRICE_TICK",    "0.10"))      # BTC price tick size (0.1 USDT)
+# Futures minimum order size and precision (Binance exchange rules).
+# Orders below MIN_ORDER_QTY, below MIN_NOTIONAL, or with wrong precision are
+# rejected outright.  Defaults come from the active SYMBOL_PROFILE above; each is
+# still env-overridable (shell / .env) for ad-hoc symbols not in the profile map.
+MIN_ORDER_QTY      = float(os.getenv("MIN_ORDER_QTY", str(_SYMBOL_PROFILE["min_order_qty"])))  # min lot size
+QTY_STEP           = float(os.getenv("QTY_STEP",      str(_SYMBOL_PROFILE["qty_step"])))        # quantity step
+PRICE_TICK         = float(os.getenv("PRICE_TICK",    str(_SYMBOL_PROFILE["price_tick"])))      # price tick size
+# Minimum order notional (qty × price) the exchange will accept.  Orders whose
+# notional falls below this are rejected — guards tiny accounts on high-priced
+# contracts (e.g. 0.001 oz gold × $4 400 = $4.40 < $5).
+MIN_NOTIONAL       = float(os.getenv("MIN_NOTIONAL", str(_SYMBOL_PROFILE["min_notional"])))     # min order notional (USDT)
 
 # Heartbeat: log a status line every N seconds even with no trade activity.
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "900"))    # 15 min

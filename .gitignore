@@ -6,7 +6,9 @@
 .env
 *.env
 .env.*
-!.env.example        # keep the template
+# keep the templates (gitignore has no inline comments — keep these on own lines)
+!.env.example
+!.env.*.example
 
 data
 docs

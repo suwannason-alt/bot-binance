@@ -359,6 +359,13 @@ class Trader:
             )
             return None
 
+        if qty * signal.entry < config.MIN_NOTIONAL:
+            logger.warning(
+                f"Order notional ${qty * signal.entry:.2f} < MIN_NOTIONAL "
+                f"${config.MIN_NOTIONAL:.2f} — skipping trade (account too small for this contract)"
+            )
+            return None
+
         # ── Sizing mode label for the trade log ──────────────────────────────
         if config.EQUITY_PERCENT > 0:
             margin_usd   = equity * (config.EQUITY_PERCENT / 100.0)

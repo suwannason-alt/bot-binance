@@ -623,6 +623,14 @@ if __name__ == "__main__":
     # ── Build config dict from base + CLI overrides ───────────────────────────
     run_config = dict(_BASE)
 
+    # Per-symbol strategy profile (e.g. the aggressive XAUUSDT gold matrix).  Only
+    # symbols whose SYMBOL_PROFILES entry carries a "strategy" block are affected,
+    # so the BTC backtest is untouched.  Applied before CLI flags → flags still win.
+    _profile_strat = config.SYMBOL_PROFILES.get(args.symbol, {}).get("strategy", {})
+    if _profile_strat:
+        run_config.update(_profile_strat)
+        print(f"  ► Applied {args.symbol} strategy profile: {_profile_strat}")
+
     if args.leverage       is not None:
         run_config["LEVERAGE"]           = args.leverage
     if args.order_balance  is not None:

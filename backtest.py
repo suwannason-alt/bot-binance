@@ -1084,6 +1084,8 @@ def run(
         )
         if qty < config.MIN_ORDER_QTY:
             continue
+        if qty * entry_price < config.MIN_NOTIONAL:   # exchange min-notional guard
+            continue
 
         balance -= _commission_cost(entry_price, qty)
         position = _OpenPosition(
