@@ -43,12 +43,18 @@ def _price_path(entry: float, atr: float, side: str) -> list[float]:
     return [entry + sign * s * atr for s in steps]
 
 
-def _run_case(trader: Trader, side: str, adaptive: bool) -> None:
+def _run_case(trader: Trader, side: str, adaptive: bool, *,
+              activate: float, lock: float, stop: float) -> None:
     entry, atr = 100.0, 1.0
     sl = entry - 1.5 * atr if side == "LONG" else entry + 1.5 * atr
     tp = entry + 6.0 * atr if side == "LONG" else entry - 6.0 * atr
 
+    # Pin the full trail config on the module both paths read, so the comparison
+    # is hermetic regardless of .env / _BASE drift.
     config.ADAPTIVE_TRAILING_ENABLED = adaptive
+    config.TRAIL_ACTIVATE_ATR = activate
+    config.TRAIL_LOCK_ATR = lock
+    config.TRAIL_STOP_ATR = stop
     live, bt = _make_pair(side, entry, atr, sl, tp)
 
     for price in _price_path(entry, atr, side):
@@ -65,19 +71,23 @@ def _run_case(trader: Trader, side: str, adaptive: bool) -> None:
 
 
 def main() -> int:
-    # Pin the trail params so the test is independent of .env / _BASE drift.
-    config.TRAIL_ACTIVATE_ATR = 2.0
-    config.TRAIL_STOP_ATR = 1.5
-    config.TRAIL_LOCK_ATR = 0.0
     config.ATR_SL_MULTIPLIER = 1.5
     config.ADAPTIVE_TRAIL_MIN_ATR = 0.35
 
     trader = Trader()  # paper mode (PAPER_TRADING default true) — no exchange init
 
-    print("Live/backtest trailing-stop parity")
+    # 1) Classic + adaptive sweep — BE activation + dynamic trail (LOCK off).
+    print("Live/backtest trailing-stop parity — classic/adaptive sweep")
     for adaptive in (False, True):
         for side in ("LONG", "SHORT"):
-            _run_case(trader, side, adaptive)
+            _run_case(trader, side, adaptive, activate=2.0, lock=0.0, stop=1.5)
+
+    # 2) Live deploy profile — exercises ALL THREE classic stages, including the
+    #    LOCK stage (TRAIL_LOCK_ATR>0) that stage (1) never reaches.  This is the
+    #    config actually shipping to live: BE@1.5 → LOCK@2.0 → TRAIL@1.2.
+    print("Live deploy profile (classic ACTIVATE=1.5 LOCK=2.0 STOP=1.2)")
+    for side in ("LONG", "SHORT"):
+        _run_case(trader, side, adaptive=False, activate=1.5, lock=2.0, stop=1.2)
 
     print("ALL PARITY CHECKS PASSED")
     return 0

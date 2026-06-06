@@ -939,6 +939,15 @@ class Trader:
         stop-market order is cancelled and a new one is placed at the updated
         price.
 
+        One-tick dedupe: this runs on every markPrice tick (~1/s), so with a
+        dynamic trail (``TRAIL_STOP_ATR > 0``) the raw float SL nudges up on
+        almost every favourable tick.  The resting exchange order, however, is
+        always at ``_round_price(previous pos.sl)`` — so if the new SL rounds to
+        the *same* tick, the exchange order is already correct.  We skip the
+        cancel+replace in that case, eliminating both the needless API round-trip
+        and the brief window where the position sits unprotected between the
+        cancel and the re-place.
+
         Args:
             price: Current mark price used to evaluate trail thresholds.
         """
@@ -953,6 +962,10 @@ class Trader:
         sym      = config.SYMBOL_CCXT
         sl_side  = "sell" if pos.side == "LONG" else "buy"
         new_sl_p = self._round_price(pos.sl)
+
+        # Skip when the rounded stop price is unchanged from the resting order.
+        if abs(new_sl_p - self._round_price(sl_before)) < config.PRICE_TICK / 2:
+            return
 
         try:
             await loop.run_in_executor(
