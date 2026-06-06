@@ -142,7 +142,7 @@ REQUIRE_MACD_CONFIRM = False   # if True, breakout also requires MACD hist direc
 # ── Regime / trend-strength filters ──────────────────────────────────────────
 # Both filters guard against trading in flat/choppy markets (no directional trend).
 EMA_SLOPE_MIN_PCT = 0.15   # EMA200 must have moved ≥ 0.15% over EMA_TREND_SLOPE_BARS (0=off)
-ATR_RATIO_MIN     = 1.15   # current ATR must be ≥ 1.15× its 20-bar SMA — expanding volatility
+ATR_RATIO_MIN     = 1.10   # current ATR must be ≥ 1.15× its 20-bar SMA — expanding volatility
 ADX_PERIOD        = 14     # ADX lookback period
 ADX_MIN           = 20.0   # require ADX ≥ 20 to trade; blocks choppy/ranging markets
 # EMA200 distance filter: require price to be at least X% away from EMA200.
