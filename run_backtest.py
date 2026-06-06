@@ -577,6 +577,16 @@ def parse_args() -> argparse.Namespace:
         metavar="ATR",
         help="Lock 1×ATR profit after N×ATR move (default: 0 = off).",
     )
+    parser.add_argument(
+        "--trail-activate", type=float, default=None,
+        metavar="ATR",
+        help="Move SL to break-even after price moves N×ATR in favor (default: 1.5; 0 = off).",
+    )
+    parser.add_argument(
+        "--trail-stop", type=float, default=None,
+        metavar="ATR",
+        help="Dynamic trail: trail SL at N×ATR behind the running peak after BE (default: 0 = off).",
+    )
 
     # ── Goal overrides ────────────────────────────────────────────────────────
     parser.add_argument(
@@ -639,6 +649,10 @@ if __name__ == "__main__":
         run_config["BREAKOUT_PERIOD"]    = args.breakout
     if args.trail_lock     is not None:
         run_config["TRAIL_LOCK_ATR"]     = args.trail_lock
+    if args.trail_activate is not None:
+        run_config["TRAIL_ACTIVATE_ATR"] = args.trail_activate
+    if args.trail_stop     is not None:
+        run_config["TRAIL_STOP_ATR"]     = args.trail_stop
 
     # ── Autonomous feature flags ──────────────────────────────────────────────
     use_all = args.all_features

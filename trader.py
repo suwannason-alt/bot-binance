@@ -615,8 +615,91 @@ class Trader:
         return None
 
     def _apply_trail(self, pos: Position, price: float) -> bool:
+        """Dispatch trailing-stop logic — mirrors ``backtest._update_trailing_stop``.
+
+        When ``ADAPTIVE_TRAILING_ENABLED`` is ``True`` the position is managed by
+        the single continuous tightening funnel (:meth:`_apply_adaptive_trail`);
+        otherwise the classic three-stage cascade (:meth:`_apply_classic_trail`)
+        runs.  Keeping this dispatch identical to the backtest is the CLAUDE.md
+        live/backtest sync contract — before this guard the live path always ran
+        the classic cascade while the backtest honoured the flag, so enabling
+        adaptive trailing silently diverged the two.
+
+        Returns:
+            ``True`` if the SL changed (caller updates the exchange SL order in
+            live mode).
         """
-        Apply full trailing-stop logic — mirrors backtest behaviour exactly.
+        if pos.initial_atr <= 0:
+            return False
+        if config.ADAPTIVE_TRAILING_ENABLED:
+            return self._apply_adaptive_trail(pos, price)
+        return self._apply_classic_trail(pos, price)
+
+    def _apply_adaptive_trail(self, pos: Position, price: float) -> bool:
+        """Single tightening trailing funnel — mirrors ``backtest._apply_adaptive_trail``.
+
+        The trail distance shrinks linearly from ``ATR_SL_MULTIPLIER`` at
+        activation to ``ADAPTIVE_TRAIL_MIN_ATR`` as price advances toward the TP
+        target, converting break-even exits into profitable trailed exits.
+
+        Live mode sees only the current mark ``price`` (no intrabar high/low), so
+        ``price`` drives both the favour check and the running peak — the same
+        single-price behaviour as the classic live trail.
+
+        Returns:
+            ``True`` if the SL moved (caller updates the exchange SL order).
+        """
+        atr     = pos.initial_atr
+        entry   = pos.entry
+        tp      = pos.tp
+        is_long = pos.side == "LONG"
+        sl_changed = False
+
+        # ── Activation gate — same threshold as classic Stage-1 break-even ────
+        if not pos.trail_activated:
+            favour = (price - entry) if is_long else (entry - price)
+            if config.TRAIL_ACTIVATE_ATR > 0 and favour < config.TRAIL_ACTIVATE_ATR * atr:
+                return False  # not yet in sufficient profit to begin trailing
+            pos.trail_activated = True
+            pos.trail_peak = price
+            logger.info(
+                f"Trail ADAPT activated — peak={price:.2f}  "
+                f"(+{favour:.2f} = {favour / atr:.1f}×ATR in favor)"
+            )
+
+        # ── Update running peak ───────────────────────────────────────────────
+        if is_long:
+            pos.trail_peak = max(pos.trail_peak, price)
+        else:
+            pos.trail_peak = min(pos.trail_peak, price) if pos.trail_peak > 0 else price
+        peak = pos.trail_peak
+
+        # ── Progress toward TP  [0.0 = just activated … 1.0 = peak at TP] ─────
+        tp_dist     = abs(tp - entry)
+        favour_peak = (peak - entry) if is_long else (entry - peak)
+        progress    = max(0.0, min(1.0, favour_peak / tp_dist if tp_dist > 0 else 0.0))
+
+        # ── Adaptive trail distance — linear lerp (wide at BE → tight near TP) ─
+        max_trail = config.ATR_SL_MULTIPLIER
+        min_trail = config.ADAPTIVE_TRAIL_MIN_ATR
+        trail_atr = max_trail + (min_trail - max_trail) * progress
+
+        trail_price = (peak - trail_atr * atr) if is_long else (peak + trail_atr * atr)
+
+        # ── Ratchet — SL moves only in the favourable direction ───────────────
+        if is_long and trail_price > pos.sl:
+            pos.sl = trail_price
+            sl_changed = True
+        elif not is_long and trail_price < pos.sl:
+            pos.sl = trail_price
+            sl_changed = True
+
+        return sl_changed
+
+    def _apply_classic_trail(self, pos: Position, price: float) -> bool:
+        """
+        Apply the classic three-stage trailing cascade — mirrors
+        ``backtest._apply_classic_trail`` exactly.
 
         Three independent stages (all controlled by config):
           1. Break-even (TRAIL_ACTIVATE_ATR): SL → entry once price moves N×ATR
