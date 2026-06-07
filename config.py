@@ -66,13 +66,13 @@ if not PAPER_TRADING:
 SYMBOL      = os.getenv("SYMBOL", "BTCUSDT")
 SYMBOL_CCXT = f"{SYMBOL[:3]}/{SYMBOL[3:]}"
 
-# ── Telegram notifications ────────────────────────────────────────────────────
-# Leave TELEGRAM_BOT_TOKEN empty to disable all Telegram alerts.
-# Alert level mirrors Python logging levels: DEBUG/INFO/WARNING/ERROR/CRITICAL.
-TELEGRAM_BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN",  "")
-TELEGRAM_CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID",    "")
-TELEGRAM_ALERT_LEVEL = os.getenv("TELEGRAM_ALERT_LEVEL", "INFO").upper()
-TELEGRAM_ENABLED     = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+# ── Discord notifications ─────────────────────────────────────────────────────
+# Create a Channel → Integrations → Webhook in Discord and paste its URL here.
+# Leave DISCORD_WEBHOOK_URL empty to disable all Discord alerts (no-op).
+#   • Hourly 1H-bar "Entry funnel" status report (fires every 1H close).
+#   • Trade open / close alerts.
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+DISCORD_ENABLED     = bool(DISCORD_WEBHOOK_URL)
 
 # ── State persistence ─────────────────────────────────────────────────────────
 # Path to the SQLite database used by StateManager for crash recovery.

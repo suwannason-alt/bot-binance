@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import config
+import notifier
 import strategy
 from backtest import StrategyState
 from data_store import MarketState
@@ -242,6 +243,16 @@ async def on_1h_close(mstate: MarketState) -> None:
     # ── Memory log every 1H candle close ─────────────────────────────────────
     logger.debug("1H close mem=%.1f MB  bar=%d", _rss_mb(), _bar_counter)
 
+    # ── 3c. Hourly Discord status report ──────────────────────────────────────
+    # Fires on EVERY 1H close, BEFORE all the entry guards below, so the channel
+    # always receives the live "Entry funnel" diagnostics — even on no-signal
+    # bars or when a daily/funding/cooldown guard will skip the entry. The body
+    # mirrors exactly what the console logs print for this bar. Best-effort: the
+    # notifier swallows every error, so a Discord outage can never stall the loop.
+    if config.WFO_ENABLED:
+        config.BREAKOUT_PERIOD = _strat_state.active_bp  # funnel shows WFO's BP
+    await _send_1h_discord_report(mstate)
+
     # ── 3b. Initial cooldown gate (indicator settling) ────────────────────────
     # Suppress entries for the first INITIAL_COOLDOWN_BARS 1H bars after startup.
     # WFO state above has already been updated (training accumulates normally).
@@ -339,6 +350,10 @@ async def on_1h_close(mstate: MarketState) -> None:
                 f"  Position opened  qty={pos.qty:.4f}  "
                 f"balance={trader.balance:.2f} USDT  day_pnl={trader.day_pnl:+.2f}"
             )
+            await notifier.send_trade_open(
+                side=pos.side, entry=pos.entry, sl=pos.sl, tp=pos.tp,
+                qty=pos.qty, reason=sig.reason,
+            )
     else:
         # ── Entry-funnel diagnostic — observability only, never gates trades ──
         diag = strategy.diagnose_1h_live(mstate, _bars_since_last_1h)
@@ -354,6 +369,50 @@ async def on_1h_close(mstate: MarketState) -> None:
 
     # ── 6. State persistence ──────────────────────────────────────────────────
     _maybe_save_state()
+
+
+# ---------------------------------------------------------------------------
+# Discord hourly status report
+# ---------------------------------------------------------------------------
+
+async def _send_1h_discord_report(mstate: MarketState) -> None:
+    """Send the per-1H-bar "Entry funnel" status report to Discord.
+
+    Builds the same context + funnel block the console logs show for this bar
+    and hands it to the (error-swallowing) notifier.  Best-effort: returns
+    cleanly when the webhook is unset or the 1H buffer is still warming, and the
+    notifier itself never raises — so this is safe to call on every 1H close.
+
+    Args:
+        mstate: Current :class:`~data_store.MarketState` with updated buffers.
+    """
+    if not config.DISCORD_ENABLED:
+        return
+    try:
+        close = (
+            float(mstate.buf_1h.arrays()[3][-1])
+            if mstate.buf_1h.count else float("nan")
+        )
+    except (IndexError, ValueError):
+        close = float("nan")
+
+    ctx = (
+        f"1H close #{_bar_counter}  close={close:.2f}  "
+        f"buf_1h={mstate.buf_1h.count}  bars_since={_bars_since_last_1h}\n"
+        f"mark={mstate.mark_price:.2f}  BP={_strat_state.active_bp}bars  "
+        f"funding={mstate.funding_rate:.4%}  day_pnl={trader.day_pnl:+.2f}  "
+        f"balance={trader.balance:.2f}"
+    )
+    diag = strategy.diagnose_1h_live(mstate, _bars_since_last_1h)
+    if diag is not None:
+        body = f"{ctx}\n\n{diag.text}"
+    else:
+        body = (
+            f"{ctx}\n\n  (buffer warming: "
+            f"{mstate.buf_1h.count}/{config.MIN_CANDLES_1H})"
+        )
+    header = "🤖 **Trading Bot Status Update** ➔ 1H Bar Evaluation"
+    await notifier.send_funnel_report(header, body)
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +480,10 @@ async def on_tick(mstate: MarketState, price: float) -> None:
             f"trades={stats['trades']}  win_rate={stats['win_rate']:.1f}%  "
             f"(TP={stats['tp_exits']} SL={stats['sl_exits']} BE={stats['be_exits']})  "
             f"consec_SL={stats['consecutive_losses']}"
+        )
+        await notifier.send_trade_closed(
+            side=closed.side, close_reason=closed.close_reason, pnl=closed.pnl,
+            balance=stats["balance"], win_rate=stats["win_rate"],
         )
         # Post-SL extended cooldown: prevent re-entering the same whipsaw.
         # Sets bars_since_last to a negative offset so the strategy cooldown

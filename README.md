@@ -228,14 +228,21 @@ BINANCE_API_SECRET=<your real secret>
 **Strongly recommended additions:**
 
 ```env
-# Telegram alerts (get notified of every trade and error)
-TELEGRAM_BOT_TOKEN=123456789:AAF...
-TELEGRAM_CHAT_ID=987654321
+# Discord alerts — hourly "Entry funnel" status report on every 1H bar close,
+# plus trade open/close notifications. Leave blank to disable (notifier no-ops).
+# Create one in Discord: Channel → Edit → Integrations → Webhooks → New Webhook.
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
 
 # Hard stop after 3 consecutive SL hits
 MAX_CONSECUTIVE_LOSSES=3
 POST_SL_COOLDOWN_1H=3
 ```
+
+> **Hourly status report:** when `DISCORD_WEBHOOK_URL` is set, the bot posts the
+> full Entry-funnel diagnostics (the same gate-by-gate breakdown the console
+> logs print) to the channel on **every** 1H bar close — even on no-signal bars
+> — inside a monospaced ` ```text ` block. The notifier is fail-safe: a Discord
+> outage is logged and swallowed, never stalling the trading loop.
 
 ### Step 3 — Secure the file
 
@@ -271,6 +278,7 @@ The most important production settings:
 | `MAX_CONSECUTIVE_LOSSES` | `3` | Circuit breaker: N SLs in a row halts entries for the day |
 | `FUNDING_RATE_MAX` | `0.001` | Skip new entries above 0.10%/8h funding rate |
 | `INITIAL_COOLDOWN_BARS` | `0` | Suppress entries for first N 1H bars on fresh startup (0 = disabled; warm start already seeds indicators) |
+| `DISCORD_WEBHOOK_URL` | _(blank)_ | Discord channel webhook for the hourly Entry-funnel report + trade alerts. Blank = notifications disabled. |
 | `BOT_STATE_DB_PATH` | `bot_state.db` | SQLite state database path (auto-created) |
 
 > **Circuit breaker note:** The daily loss/profit limits are fixed-USD values calibrated to a ~$1k–$2k starting balance. As your balance compounds, consider periodically adjusting these thresholds (or switching to `DAILY_LOSS_LIMIT_PCT` / `DAILY_PROFIT_TARGET_PCT` in `.env`) to maintain proportional risk control.
@@ -778,6 +786,7 @@ trading-bot/
 ├── main.py                  Bot entry point — live/paper trading loop + CLI flags
 ├── strategy.py              Signal logic: evaluate_1h_live(), position_size_usdt()
 ├── trader.py                Order execution, equity fetch, daily P&L tracking
+├── notifier.py              Async Discord webhook client (hourly funnel report + trade alerts)
 │
 ├── backtest.py              Vectorised backtesting engine
 ├── run_backtest.py          Single-call autonomous runner (WFO on, 6-year default)
