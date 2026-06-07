@@ -4,9 +4,18 @@ Convention (matches test_signal_diagnostics.py): no pytest. Each test_* function
 raises AssertionError on failure; main() runs them all and exits non-zero if any
 fail.
 
-Run:  python test_sweep_assets.py
+Run:  python tests/test_sweep_assets.py
 """
+# ── Path bootstrap: modular layout — keep flat `import config` style resolvable
+# from any subdirectory (src/core, backtesting, scripts). ──────────────────────
 import sys
+import pathlib
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+for _seg in ("", "src/core", "backtesting", "scripts"):
+    _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
 import types
 
 import numpy as np

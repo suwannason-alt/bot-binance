@@ -39,6 +39,15 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+# ── Path bootstrap: modular layout — add the package dirs to sys.path so the flat
+# `import config` / `from trader import …` style resolves after the restructure. ─
+import pathlib
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent
+for _seg in ("", "src/core", "backtesting", "scripts"):
+    _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
 import config
 import notifier
 import strategy

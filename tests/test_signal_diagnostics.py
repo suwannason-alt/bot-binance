@@ -10,9 +10,18 @@ If they ever diverge, the live log would lie about why the bot did/didn't trade.
 This test locks them together so the observability layer can never drift away
 from the real entry logic.
 
-Run:  python test_signal_diagnostics.py     (exits non-zero on any mismatch)
+Run:  python tests/test_signal_diagnostics.py   (exits non-zero on any mismatch)
 """
+# ── Path bootstrap: modular layout — keep flat `import config` style resolvable
+# from any subdirectory (src/core, backtesting, scripts). ──────────────────────
 import sys
+import pathlib
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+for _seg in ("", "src/core", "backtesting", "scripts"):
+    _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
 
 import numpy as np
 import pandas as pd

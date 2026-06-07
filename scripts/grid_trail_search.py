@@ -14,6 +14,16 @@ Run:  python grid_trail_search.py
 """
 from __future__ import annotations
 
+# ── Path bootstrap: modular layout — keep flat `import config` / `import backtest`
+# style resolvable from any subdirectory (src/core, backtesting, scripts). ──────
+import sys
+import pathlib
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+for _seg in ("", "src/core", "backtesting", "scripts"):
+    _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
+
 import asyncio
 import logging
 import statistics

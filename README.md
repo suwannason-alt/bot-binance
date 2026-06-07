@@ -341,7 +341,7 @@ Startup sequence
 Run `verify_warmup.py` to validate that all indicators are properly seeded before deployment:
 
 ```bash
-python verify_warmup.py
+python scripts/verify_warmup.py
 ```
 
 This diagnostic checks:
@@ -587,41 +587,41 @@ All backtests use locally cached CSV data (fetched once, stored in `data/`).
 
 ```bash
 # Default: 6-year WFO backtest (matches live production config, max available data)
-python run_backtest.py
+python backtesting/run_backtest.py
 
 # Classic mode — fixed BREAKOUT_PERIOD=14, no WFO
-python run_backtest.py --no-wfo
+python backtesting/run_backtest.py --no-wfo
 
 # 5-year window
-python run_backtest.py --days 1825
+python backtesting/run_backtest.py --days 1825
 
 # 3-year window (faster iteration during param tuning)
-python run_backtest.py --days 1095
+python backtesting/run_backtest.py --days 1095
 
 # WFO + Markov regime forecast
-python run_backtest.py --forecast
+python backtesting/run_backtest.py --forecast
 
 # Run all feature combinations (benchmark sweep)
-python run_backtest.py --all
+python backtesting/run_backtest.py --all
 
 # Custom risk / TP parameters
-python run_backtest.py --risk 6 --tp 7.0 --adx 25
+python backtesting/run_backtest.py --risk 6 --tp 7.0 --adx 25
 
 # Tighter goal criteria
-python run_backtest.py --min-cagr 30 --max-dd 60
+python backtesting/run_backtest.py --min-cagr 30 --max-dd 60
 
 # Allow 1 bad year out of 6 (year-fraction threshold = 83%)
-python run_backtest.py --year-frac 0.8
+python backtesting/run_backtest.py --year-frac 0.8
 
 # Show all available flags
-python run_backtest.py --help
+python backtesting/run_backtest.py --help
 ```
 
 ### Validate warmup before deploying config changes
 
 ```bash
 # Run diagnostic to verify indicator seeding and no-lookahead guarantees
-python verify_warmup.py
+python scripts/verify_warmup.py
 ```
 
 ### Multi-asset ATR_RATIO sweep (`sweep_assets.py`)
@@ -648,19 +648,19 @@ out-of-sample. Sorted by ΔPF, then MaxDD. Console-only output, no log files.
 
 ```bash
 # Full 5-year sweep across the default candidate pool (BTC included as control)
-python sweep_assets.py
+python scripts/sweep_assets.py
 
 # Faster screen on a shorter window
-python sweep_assets.py --days 730
+python scripts/sweep_assets.py --days 730
 
 # Specific pairs only
-python sweep_assets.py --candidates ETHUSDT,SOLUSDT,AVAXUSDT
+python scripts/sweep_assets.py --candidates ETHUSDT,SOLUSDT,AVAXUSDT
 
 # Custom split / ruin floor
-python sweep_assets.py --split 0.6 --ruin-floor -40
+python scripts/sweep_assets.py --split 0.6 --ruin-floor -40
 
 # Show all flags
-python sweep_assets.py --help
+python scripts/sweep_assets.py --help
 ```
 
 > **Heads-up:** uses live Binance fetch + the `data/` cache. A cold full
@@ -671,7 +671,7 @@ python sweep_assets.py --help
 Run the tool's unit tests (standalone, no pytest required):
 
 ```bash
-python test_sweep_assets.py
+python tests/test_sweep_assets.py
 ```
 
 ---
@@ -783,32 +783,43 @@ docker compose run --rm binance-bot ls -lh /app/state/bot_state.db   # Docker
 ```
 trading-bot/
 │
-├── main.py                  Bot entry point — live/paper trading loop + CLI flags
-├── strategy.py              Signal logic: evaluate_1h_live(), position_size_usdt()
-├── trader.py                Order execution, equity fetch, daily P&L tracking
-├── notifier.py              Async Discord webhook client (hourly funnel report + trade alerts)
+├── main.py                  Bot entry point — live/paper trading loop + CLI flags (root)
+├── conftest.py              Pytest path bootstrap (mirrors the per-entry sys.path shim)
 │
-├── backtest.py              Vectorised backtesting engine
-├── run_backtest.py          Single-call autonomous runner (WFO on, 6-year default)
-├── sweep_assets.py          Multi-asset ATR_RATIO 1.10-vs-1.15 out-of-sample sweep
-├── test_sweep_assets.py     Standalone unit tests for sweep_assets.py (no pytest)
-├── visualize.py             Equity curve + trade marker charts
-├── verify_warmup.py         Warmup diagnostic — checks indicator seeding & no-lookahead
+├── src/core/                ── Live runtime engine ──
+│   ├── config.py            All strategy & risk parameters (env-driven; loads <root>/.env)
+│   ├── trader.py            Order execution, equity fetch, daily P&L tracking
+│   ├── notifier.py          Async Discord webhook client (hourly funnel report + trade alerts)
+│   ├── strategy.py          Signal logic: evaluate_1h_live(), position_size_usdt()
+│   ├── data_store.py        Rolling OHLCV buffers for live candle state
+│   ├── ws_client.py         Binance WebSocket client (5M + 1H + markPrice)
+│   ├── indicators.py        NumPy indicator library (EMA, RSI, ATR, ADX, BB)
+│   ├── warm_start.py        Historical pre-loader + dry-run hydration
+│   ├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning + dynamic lookback
+│   ├── regime_forecast.py   Markov regime forecaster (TREND/CHOPPY/QUIET)
+│   ├── adaptive_regime.py   Hurst exponent + BBW + ADX composite regime scorer
+│   └── state_manager.py     SQLite crash-recovery persistence
 │
-├── config.py                All strategy & risk parameters (env-driven)
-├── indicators.py            NumPy indicator library (EMA, RSI, ATR, ADX, BB)
-├── adaptive_regime.py       Hurst exponent + BBW + ADX composite regime scorer
+├── backtesting/             ── Validation engines ──
+│   ├── backtest.py          Vectorised backtesting engine
+│   ├── run_backtest.py      Single-call autonomous runner (WFO on, 6-year default)
+│   ├── fetch_data.py        Historical data downloader (Binance REST API; caches to <root>/data)
+│   └── visualize.py         Equity curve + trade marker charts
 │
-├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning + dynamic lookback
-├── regime_forecast.py         Markov regime forecaster (TREND/CHOPPY/QUIET)
-├── state_manager.py           SQLite crash-recovery persistence
-├── warm_start.py              Historical pre-loader + dry-run hydration
+├── scripts/                 ── Analytical / diagnostic utilities ──
+│   ├── grid_trail_search.py     TRAIL grid search (PF+MAR growth lens)
+│   ├── grid_trail_analysis.py   TRAIL grid (capital-preservation lens + RISK sweep)
+│   ├── sweep_assets.py          Multi-asset ATR_RATIO out-of-sample sweep
+│   ├── verify_warmup.py         Warmup diagnostic — indicator seeding & no-lookahead
+│   └── probe_ws.py              Standalone Binance WS connectivity probe
 │
-├── data_store.py            Rolling OHLCV buffers for live candle state
-├── ws_client.py             Binance WebSocket client (5M + 1H + markPrice)
-├── fetch_data.py            Historical data downloader (Binance REST API)
+├── tests/                   ── Parity & regression suites (NO pytest; standalone runners) ──
+│   ├── test_trail_parity.py     Live/backtest trailing-stop parity (sync contract)
+│   ├── test_trail_dedupe.py     Live SL one-tick dedupe guard
+│   ├── test_signal_diagnostics.py  Entry-funnel diagnostic drift guard
+│   └── test_sweep_assets.py     Unit tests for sweep_assets.py
 │
-├── Dockerfile               Multi-stage build (python:3.12.7-slim-bullseye)
+├── Dockerfile               Multi-stage build (python:3.12.7-slim-bullseye); COPYs main.py + src/ + backtesting/
 ├── docker-compose.yml       Named volumes, restart policy, log rotation
 ├── .dockerignore            Excludes .env, data/, __pycache__ from build context
 │

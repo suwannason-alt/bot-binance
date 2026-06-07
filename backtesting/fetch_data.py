@@ -25,7 +25,9 @@ logger = logging.getLogger("fetch_data")
 # ---------------------------------------------------------------------------
 
 FAPI_BASE = "https://fapi.binance.com/fapi/v1/klines"
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+# Anchor the CSV cache to the repo root (fetch_data.py lives in backtesting/ after
+# the restructure), so it stays at <root>/data — matching the Docker /app/data volume.
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 
 INTERVAL_MS: dict[str, int] = {
     "1m":  60_000,

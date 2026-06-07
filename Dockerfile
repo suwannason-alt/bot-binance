@@ -72,8 +72,13 @@ RUN useradd --system --create-home --uid 1001 --shell /bin/bash botuser
 WORKDIR /app
 
 # ── Application source ────────────────────────────────────────────────────────
-# Copy every .py file; .dockerignore excludes .env, data/, __pycache__, etc.
-COPY *.py ./
+# Modular layout: copy the entry point + the two runtime package dirs.
+# (`tests/` and `scripts/` are NOT needed at runtime → excluded to keep the image
+#  lean; main.py's sys.path shim tolerates the absent scripts/ dir.)
+# .dockerignore still excludes .env, data/, __pycache__, etc.
+COPY main.py ./
+COPY src ./src
+COPY backtesting ./backtesting
 
 # ── Persistent mount points ───────────────────────────────────────────────────
 # Create the directories now (owned by botuser) so Docker can overlay named

@@ -9,7 +9,8 @@
 #    Rebuild image      :  docker compose build --no-cache && docker compose up -d
 #    One-off shell      :  docker compose run --rm binance-bot bash (opens shell)
 #    Reset state DB     :  docker compose run --rm binance-bot \
-#                            python -c "from state_manager import StateManager; \
+#                            python -c "import sys; sys.path.insert(0,'src/core'); \
+#                                       from state_manager import StateManager; \
 #                                       StateManager('/app/state/bot_state.db').clear()"
 # =============================================================================
 

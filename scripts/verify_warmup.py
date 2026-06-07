@@ -36,9 +36,13 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
-# Adjust sys.path so this script can be run from any working directory.
-_ROOT = Path(__file__).parent
-sys.path.insert(0, str(_ROOT))
+# Adjust sys.path (modular layout) so this script resolves the flat `import config`
+# style from any working directory: add repo root + src/core + backtesting + scripts.
+_ROOT = Path(__file__).resolve().parents[1]
+for _seg in ("", "src/core", "backtesting", "scripts"):
+    _dir = str(_ROOT / _seg) if _seg else str(_ROOT)
+    if _dir not in sys.path:
+        sys.path.insert(0, _dir)
 
 import config
 import indicators as ind

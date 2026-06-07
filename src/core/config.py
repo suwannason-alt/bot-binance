@@ -25,9 +25,17 @@ immediately — the process exits before touching any exchange endpoint.
 """
 import os
 import sys
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+# Repo root = two levels up from src/core/config.py.  Anchoring to it keeps the
+# `.env` and default state-DB locations correct regardless of the current working
+# directory after the modular restructure (config.py no longer sits at the root).
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Load the root .env explicitly (was a bare load_dotenv() that walked up from cwd).
+load_dotenv(_REPO_ROOT / ".env")
 
 # ── Runtime environment ───────────────────────────────────────────────────────
 # Values: "production" | "staging" | "development"
@@ -76,10 +84,11 @@ DISCORD_ENABLED     = bool(DISCORD_WEBHOOK_URL)
 
 # ── State persistence ─────────────────────────────────────────────────────────
 # Path to the SQLite database used by StateManager for crash recovery.
-# Relative paths are resolved from the directory that contains config.py.
+# Default is anchored to the repo root (NOT src/core/) so it stays at the project
+# top level; relative env overrides resolve from the current working directory.
 BOT_STATE_DB_PATH = os.getenv(
     "BOT_STATE_DB_PATH",
-    os.path.join(os.path.dirname(__file__), "bot_state.db"),
+    os.path.join(str(_REPO_ROOT), "bot_state.db"),
 )
 
 WS_URL = (

@@ -89,8 +89,11 @@ class StateManager:
 
     def __init__(self, db_path: Optional[str] = None) -> None:
         if db_path is None:
+            # Anchor to the repo root (state_manager.py lives in src/core/ after the
+            # restructure) so the default DB stays at the project top level.
             db_path = os.path.join(
-                os.path.dirname(__file__), _DB_FILENAME
+                os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                _DB_FILENAME,
             )
         self._db_path = db_path
         self._init_schema()
