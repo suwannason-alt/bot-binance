@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 import pathlib
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
@@ -23,7 +23,7 @@ for _seg in ("", "src/core", "backtesting", "scripts"):
 import asyncio
 import sys
 
-import config
+import config_1h as config   # dedupe test tunes the 1H trail config the trader reads
 from trader import Trader, Position
 
 

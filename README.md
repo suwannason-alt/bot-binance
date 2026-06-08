@@ -1,8 +1,14 @@
-# BTCUSDT Futures Trading Bot
+# Multi-Asset 1H Breakout Futures Bot
 
-Autonomous algorithmic trading bot for **Binance USDT-M Perpetual Futures**.  
-Strategy: **1H momentum breakout** with **Walk-Forward Optimization (WFO) on by default**.  
-Verified over **6 years of live Binance USDT-M Futures data** (Sep 2019 → May 2026).
+Autonomous algorithmic trading bot for **Binance USDT-M Perpetual Futures**, built on a
+**Feature-Based Architecture**: one shared **1H momentum-breakout engine** drives multiple
+trading **domains** (`btc/`, `eth/`, `sol/`), each with its own tuned profile and per-asset
+`ENABLED` / `TRADE_MODE` switches. **Walk-Forward Optimization (WFO) is on by default** for
+the primary symbol, and a **Profit-Based STEP Trailing SL** locks in gains as a trade runs.
+
+The flagship **BTCUSDT** profile is verified over **6 years** of live Binance USDT-M data
+(Sep 2019 → May 2026). ETH/SOL are newer, in-sample profiles — see §1 and §2 for the
+honest validation status before risking capital.
 
 ---
 
@@ -23,6 +29,72 @@ Verified over **6 years of live Binance USDT-M Futures data** (Sep 2019 → May 
 ---
 
 ## 1. Project Architecture Overview
+
+### Feature-Based Architecture
+
+One **shared 1H breakout engine** is reused by per-asset **domains**. A domain is just a
+folder with two files: a `config.py` (the tuned profile + on/off switches — the source of
+truth) and a `processor.py` (a thin shell that binds the symbol to the shared engine — no
+duplicated strategy logic).
+
+```
+src/core/
+├── shared/         cross-asset infra (config, trader, order_manager, ws_client,
+│                   notifier, data_store, indicators, state_manager)
+├── strategy_1h/    the ONE shared 1H breakout engine (strategy, config_1h,
+│                   asset_processor, walk_forward_optimizer, warm_start, regime_forecast)
+├── btc/  config.py + processor.py   ← BTC domain  (proven flagship profile)
+├── eth/  config.py + processor.py   ← ETH domain  (in-sample profile)
+└── sol/  config.py + processor.py   ← SOL domain  (in-sample, marginal edge)
+```
+
+Each domain `config.py` is assembled into `config_1h.CONFIG_MATRIX`; at startup
+`config.apply_symbol(sym)` writes that symbol's tuned knobs onto the engine globals.
+**Edit a per-asset knob in its domain `config.py`, never in the matrix.**
+
+#### Per-asset switches — `ENABLED` and `TRADE_MODE`
+
+Every domain `config.py` carries two feature flags:
+
+| Flag | Values | Effect |
+|------|--------|--------|
+| `ENABLED` | `True` / `False` | Master switch — does the bot spin up this asset's processor at all? Also gates inclusion in the multi-asset backtest. |
+| `TRADE_MODE` | `"LIVE"` / `"EVAL_ONLY"` | `LIVE` places real orders (subject to `PAPER_TRADING`); `EVAL_ONLY` runs the full signal pipeline but only **logs** would-be entries (dry-run diagnostics). |
+
+> **`TRADE_MODE` × `PAPER_TRADING` — read this before going live.** `TRADE_MODE="LIVE"`
+> only places *real-money* orders when `PAPER_TRADING=false` in `.env`. With
+> `PAPER_TRADING=true` (the default) a `LIVE` asset still simulates fills locally. The
+> current shipped state is **all three symbols `ENABLED` + `LIVE`** (set during paper
+> validation). Flipping `PAPER_TRADING=false` therefore arms BTC **and** ETH/SOL at once
+> — if you only want the proven BTC profile trading real money, set ETH/SOL to
+> `TRADE_MODE="EVAL_ONLY"` first. The multi-LIVE order path has been construction- and
+> paper-validated but has **not** yet executed against a real exchange.
+
+The primary symbol (`config.SYMBOL`, BTC) keeps the proven WFO-driven live loop; every
+other `ENABLED` symbol is driven by an `AssetProcessor` on the **same** WebSocket socket
+(multi-symbol fan-out). A central `OrderManager` arbitrates margin across LIVE sleeves so
+the shared account is never oversubscribed.
+
+### Profit-Based STEP Trailing SL
+
+The production live exit logic is a **profit-locking STEP trail** that ratchets the stop
+forward as a trade gains, locking in realized-favourable movement one ATR-step at a time:
+
+```
+favour = how far price has moved in your favour, measured in ATR
+  favour < TRAIL_ACTIVATE_ATR×ATR   → stop stays at the initial SL
+  favour ≥ TRAIL_ACTIVATE_ATR×ATR   → stop jumps to BREAK-EVEN
+  each additional +1.0×ATR of favour → stop ratchets forward by +1.0×ATR locked profit
+                                        (BE → +1ATR → +2ATR → …)
+```
+
+It is **stateless** (recomputed from entry, favour and ATR each tick — no extra position
+fields) and **monotonic** (the stop only ever moves in the profitable direction). Live, it
+is recomputed on every `@markPrice` tick (~1–3 s); in the backtest, intra-hour ratchets
+are stepped on the high-resolution **5M** bars so a stop can fire mid-hour, not only on the
+1H close. `STEP_TRAILING_ENABLED` is the master switch — **on** in live + the multi-asset
+backtest, **off** for the single-asset `run_backtest.py` flagship story (which uses the
+classic trail). See §8 for how to run each.
 
 ### Strategy Core — 1H Breakout
 
@@ -82,16 +154,20 @@ on_1h_close()
 
 ### Position Sizing — Risk-Constant Model
 
-The bot uses **SL-distance-based risk sizing** as the production default. Every stop-loss hit always costs exactly 8% of balance regardless of market volatility:
+The bot uses **SL-distance-based risk sizing** as the production default. Every stop-loss hit always costs exactly `RISK_PERCENT`% of balance regardless of market volatility:
 
 | Priority | Mode | Formula | Active when |
 |----------|------|---------|------------|
 | **0 (default)** | **Equity-percent** | `qty = (equity × EQUITY_PERCENT% × leverage) / entry` | `EQUITY_PERCENT > 0` |
 | 1 | Fixed margin | `qty = (ORDER_BALANCE_USD × leverage) / entry` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD > 0` |
-| **2 (production)** | **Risk-percent** | `qty = (balance × 8%) / (entry × sl_dist_pct)` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD=0` |
+| **2 (production)** | **Risk-percent** | `qty = (balance × RISK_PERCENT%) / (entry × sl_dist_pct)` | `EQUITY_PERCENT=0`, `ORDER_BALANCE_USD=0` |
 
-**Production `.env` sets `EQUITY_PERCENT=0`**, activating the RISK_PERCENT=8% mode (Priority 2).  
-This is the proven maximum-CAGR configuration — see §2 for the performance comparison.
+`EQUITY_PERCENT=0` (the default) activates the risk-percent mode (Priority 2). `RISK_PERCENT`
+is a **hardcoded literal in `strategy_1h/config_1h.py`, not an `.env` knob** — the shipped
+value is **`4%`** (the capital-preservation default that pairs with the STEP trail). The §2
+flagship tables were generated at the **max-growth `8%`** setting (reproduce with
+`python backtesting/run_backtest.py --risk 8`); raise the literal to `8.0` only if you
+deliberately want that higher-CAGR / higher-drawdown profile.
 
 In **live mode**, equity = `totalWalletBalance + totalUnrealizedProfit` fetched from Binance at the moment of order placement.
 
@@ -99,11 +175,22 @@ In **live mode**, equity = `totalWalletBalance + totalUnrealizedProfit` fetched 
 
 ## 2. Live Performance Verdict
 
+> **Which numbers am I reading?** This section reports the **single-asset BTC flagship**
+> backtest at the **max-growth `RISK_PERCENT=8%`** setting with the classic trail — this is
+> the genuinely-validated 6-year story, reproduced by `python backtesting/run_backtest.py`.
+> The **shipped live default is different and more conservative**: `config_1h.py` ships
+> `RISK_PERCENT=4%` with the profit-locking **STEP** trail (a deliberate capital-preservation
+> pivot). The **multi-asset portfolio** (BTC+ETH+SOL, `RISK=0.5%`/sleeve, STEP trail) is a
+> separate, newer, **first-look** result — see the end of this section and treat it as a
+> hypothesis, not a validated track record.
+
+### BTC flagship — single-asset, RISK=8%, classic trail
+
 **Data period:** Sep 2019 → May 2026 (6 years — full BTCUSDT perpetual futures history)  
 **Starting balance:** $1,000 USDT  
 **Leverage:** 10× | **TP:** 6.0× ATR | **SL:** 1.5× ATR | **ADX ≥ 20**
 
-### Production results (`EQUITY_PERCENT=0`, `RISK_PERCENT=8%` — current `.env`)
+### Flagship results (`RISK_PERCENT=8%` max-growth setting — `run_backtest.py --risk 8`)
 
 | Mode | Command | CAGR | Max DD | 6-yr Return | Verdict |
 |------|---------|------|--------|-------------|---------|
@@ -126,10 +213,10 @@ Both modes target similar effective leverage at average ATR, but diverge in vola
 
 | Sizing mode | CAGR (WFO) | CAGR (Classic) | Max DD |
 |-------------|-----------|----------------|--------|
-| RISK=8% *(production)* | **+66.5%/yr** | **+72.7%/yr** | −53% |
+| RISK=8% *(max-growth)* | **+66.5%/yr** | **+72.7%/yr** | −53% |
 | EQUITY=35% | +58.3%/yr | +68.6%/yr | −38% |
 
-> EQUITY=35% has lower drawdown but significantly lower CAGR. RISK=8% is the proven maximum-growth configuration and is set in production `.env`.
+> EQUITY=35% has lower drawdown but significantly lower CAGR. RISK=8% is the proven maximum-growth configuration; the bot **ships the more conservative `RISK=4%`** (see §1) — set the literal to `8.0` in `config_1h.py` to reproduce these figures.
 
 ### Year-by-year breakdown (RISK=8%, WFO — production default)
 
@@ -162,6 +249,27 @@ Both modes target similar effective leverage at average ATR, but diverge in vola
 Year 1 covers the **earliest available BTCUSDT perpetual futures data** — a period of flat price action followed by the COVID crash in March 2020 (BTC dropped ~54% in 48 hours). With only 3 winning trades out of 24 and heavy whipsaw, the −38% is historically specific to that regime. Years 2–6 recovered everything and compounded strongly.
 
 **For live trading starting in 2026:** you will not be entering during this historical cold-start. The relevant reference years are Y5–Y6 (+53%/+60% WFO, +101%/+39% Classic).
+
+### Multi-asset portfolio — first-look (BTC+ETH+SOL, RISK=0.5%/sleeve, STEP trail)
+
+Three independent $1,000 sleeves, each on its own domain profile, under the profit-locking
+STEP trail, 5-year window (2021 → 2026). Reproduce with `python scripts/backtest_1h.py`
+(figures as of 2026-06-08; the incremental data fetch rewrites the cache daily, so the
+exact totals drift by a few dollars run-to-run):
+
+| Asset | Trades | Win% | PF | MaxDD% | Net$ | TP/SL/BE |
+|-------|-------:|-----:|---:|-------:|-----:|---------|
+| BTC | 212 | 41.0 | 1.46 | −4.1 | +160.78 | 8/77/127 |
+| ETH | 257 | 39.7 | 1.42 | −4.9 | +138.53 | 11/71/175 |
+| SOL | 314 | 29.9 | 1.03 | −14.0 | −3.84 | 30/174/110 |
+| **PORTFOLIO** | **783** | **36.1** | **1.23** | **−4.7** | **+295.46** | (start $3,000 → $3,295) |
+
+> ⚠️ **This is a hypothesis, not a validated edge.** The STEP trail is **UNVALIDATED** on
+> these params (the ETH/SOL grid sweep used a break-even-only trail; BTC was never swept).
+> ETH/SOL profiles are **in-sample** grid optima pinned at the TP=6.0 grid ceiling (a
+> boundary optimum — a classic overfitting tell), SOL's edge is **marginal** (PF ≈ 1.03,
+> −14% DD), and the LIVE multi-asset order path has **never run against a real exchange**.
+> Paper-validate before committing capital.
 
 ---
 
@@ -263,13 +371,18 @@ chmod 600 .env      # owner read/write only — other users cannot read it
 
 ### Configuration Reference
 
-All strategy parameters live in `config.py` and are tunable via `.env` overrides.
-The most important production settings:
+Configuration is split three ways after the feature-based refactor:
+
+| Where | What lives here | Editable via `.env`? |
+|-------|-----------------|----------------------|
+| `.env` → `shared/config.py` | Server / secret / exchange + run-safety knobs (keys, leverage, daily limits, funding gate, WFO toggles, Discord) | ✅ yes — the table below |
+| `strategy_1h/config_1h.py` | 1H **engine** tunables as hardcoded literals (`RISK_PERCENT`, `STEP_TRAILING_ENABLED`, sizing chain) | ❌ no — edit the literal |
+| `btc/eth/sol/config.py` | **Per-asset** profile + `ENABLED` / `TRADE_MODE` (breakout / ADX / TP / SL / trail-activate) — the source of truth assembled into `CONFIG_MATRIX` | ❌ no — edit the domain file |
+
+The `.env`-driven production settings (read by `shared/config.py`):
 
 | Variable | Production `.env` | Effect |
 |----------|------------------|--------|
-| `EQUITY_PERCENT` | `0` | **Must be 0** to activate RISK_PERCENT mode. Any value > 0 takes priority and disables risk-constant sizing. |
-| `RISK_PERCENT` | `8.0` | % of balance risked per trade — active when `EQUITY_PERCENT=0`. Each SL costs exactly 8% regardless of ATR. |
 | `LEVERAGE` | `10` | Futures leverage multiplier |
 | `WFO_ENABLED` | `true` | Auto-tune BREAKOUT_PERIOD every 30 days (default: on) |
 | `WFO_FAST_ENABLED` | `true` | Shrink WFO training window to 14 days when ATR spikes ≥ 2× mean — faster regime adaptation |
@@ -280,6 +393,12 @@ The most important production settings:
 | `INITIAL_COOLDOWN_BARS` | `0` | Suppress entries for first N 1H bars on fresh startup (0 = disabled; warm start already seeds indicators) |
 | `DISCORD_WEBHOOK_URL` | _(blank)_ | Discord channel webhook for the hourly Entry-funnel report + trade alerts. Blank = notifications disabled. |
 | `BOT_STATE_DB_PATH` | `bot_state.db` | SQLite state database path (auto-created) |
+
+> **Sizing knobs are NOT here.** `EQUITY_PERCENT`, `RISK_PERCENT`, `STEP_TRAILING_ENABLED`
+> and the per-trade sizing chain are **hardcoded literals in `strategy_1h/config_1h.py`**
+> (shipped: `EQUITY_PERCENT=0`, `RISK_PERCENT=4` — every SL costs 4% of balance). Editing
+> them in `.env` has **no effect**; change the literal. Per-asset breakout/ADX/TP/SL/trail
+> live in the domain `config.py` files (see §1).
 
 > **Circuit breaker note:** The daily loss/profit limits are fixed-USD values calibrated to a ~$1k–$2k starting balance. As your balance compounds, consider periodically adjusting these thresholds (or switching to `DAILY_LOSS_LIMIT_PCT` / `DAILY_PROFIT_TARGET_PCT` in `.env`) to maintain proportional risk control.
 
@@ -617,6 +736,38 @@ python backtesting/run_backtest.py --year-frac 0.8
 python backtesting/run_backtest.py --help
 ```
 
+> `run_backtest.py` is the **single-asset BTC flagship** runner (WFO, RISK=8%, classic
+> trail — the §2 story). For the **multi-asset STEP-trail portfolio**, use `backtest_1h.py`
+> below.
+
+### Multi-asset / portfolio backtest (`backtest_1h.py`)
+
+The primary multi-asset backtest. Each selected symbol trades its **own domain profile**
+(pulled from `btc/config.py` / `eth/config.py` / `sol/config.py` via `CONFIG_MATRIX`) as an
+independent $1,000 sleeve at `RISK=0.5%`, under the profit-locking **STEP** trail, using the
+high-resolution 5M bars for accurate intra-hour trailing. Pick any subset of symbols — a
+single-symbol run is a true single-asset backtest of that domain's profile.
+
+```bash
+# All ENABLED symbols (BTC + ETH + SOL), 5-year window — per-symbol + portfolio table
+python scripts/backtest_1h.py
+
+# A single symbol (true single-asset run of that domain's profile)
+python scripts/backtest_1h.py --symbols BTCUSDT
+
+# An explicit subset / full portfolio
+python scripts/backtest_1h.py --symbols BTCUSDT ETHUSDT SOLUSDT
+
+# Shorter window (faster iteration)
+python scripts/backtest_1h.py --days 1095
+
+# Show all flags
+python scripts/backtest_1h.py --help
+```
+
+You can also pin the default symbol set by editing the `SYMBOLS` variable at the top of
+`scripts/backtest_1h.py` (`None` = every `ENABLED` asset in the `CONFIG_MATRIX`).
+
 ### Validate warmup before deploying config changes
 
 ```bash
@@ -786,27 +937,42 @@ trading-bot/
 ├── main.py                  Bot entry point — live/paper trading loop + CLI flags (root)
 ├── conftest.py              Pytest path bootstrap (mirrors the per-entry sys.path shim)
 │
-├── src/core/                ── Live runtime engine ──
-│   ├── config.py            All strategy & risk parameters (env-driven; loads <root>/.env)
-│   ├── trader.py            Order execution, equity fetch, daily P&L tracking
-│   ├── notifier.py          Async Discord webhook client (hourly funnel report + trade alerts)
-│   ├── strategy.py          Signal logic: evaluate_1h_live(), position_size_usdt()
-│   ├── data_store.py        Rolling OHLCV buffers for live candle state
-│   ├── ws_client.py         Binance WebSocket client (5M + 1H + markPrice)
-│   ├── indicators.py        NumPy indicator library (EMA, RSI, ATR, ADX, BB)
-│   ├── warm_start.py        Historical pre-loader + dry-run hydration
-│   ├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning + dynamic lookback
-│   ├── regime_forecast.py   Markov regime forecaster (TREND/CHOPPY/QUIET)
-│   ├── adaptive_regime.py   Hurst exponent + BBW + ADX composite regime scorer
-│   └── state_manager.py     SQLite crash-recovery persistence
+├── src/core/                ── Live runtime engine (feature-based) ──
+│   │
+│   ├── shared/              ── cross-asset infrastructure ──
+│   │   ├── config.py            Server/secret/exchange + indicator base (env-driven; loads <root>/.env)
+│   │   ├── trader.py            Per-symbol order execution, equity fetch, daily P&L, trailing
+│   │   ├── order_manager.py     Cross-asset margin arbiter (global ledger for LIVE sleeves)
+│   │   ├── notifier.py          Async Discord webhook client (hourly funnel report + trade alerts)
+│   │   ├── ws_client.py         Binance WebSocket client — multi-symbol fan-out (5M + 1H + markPrice)
+│   │   ├── data_store.py        Rolling OHLCV buffers for live candle state
+│   │   ├── indicators.py        NumPy indicator library (EMA, RSI, ATR, ADX, BB)
+│   │   ├── adaptive_regime.py   Hurst exponent + BBW + ADX composite regime scorer
+│   │   └── state_manager.py     SQLite crash-recovery persistence
+│   │
+│   ├── strategy_1h/         ── the ONE shared 1H breakout engine ──
+│   │   ├── config_1h.py         Hardcoded 1H tunables; assembles CONFIG_MATRIX from the domains
+│   │   ├── strategy.py          Signal logic: evaluate_1h_live(), position_size_usdt()
+│   │   ├── asset_processor.py   Per-symbol live processor (drives each ENABLED secondary)
+│   │   ├── warm_start.py        Historical pre-loader + dry-run hydration
+│   │   ├── walk_forward_optimizer.py  WFO engine — BREAKOUT_PERIOD self-tuning + dynamic lookback
+│   │   └── regime_forecast.py   Markov regime forecaster (TREND/CHOPPY/QUIET)
+│   │
+│   ├── btc/                 ── BTC domain  (proven flagship profile) ──
+│   │   ├── config.py            ENABLED / TRADE_MODE + tuned 1H params (SOURCE OF TRUTH)
+│   │   └── processor.py         Thin Processor(AssetProcessor) shell ⇒ shared engine
+│   ├── eth/  config.py + processor.py   ── ETH domain (in-sample profile) ──
+│   └── sol/  config.py + processor.py   ── SOL domain (in-sample, marginal edge) ──
 │
 ├── backtesting/             ── Validation engines ──
-│   ├── backtest.py          Vectorised backtesting engine
-│   ├── run_backtest.py      Single-call autonomous runner (WFO on, 6-year default)
+│   ├── backtest.py          Vectorised engine — run() (single) + run_portfolio() (multi-asset)
+│   ├── run_backtest.py      Single-asset BTC flagship runner (WFO on, RISK=8%, 6-year default)
+│   ├── compare_mtf.py       1H baseline vs MTF-stop A/B (rejected experiment; diagnostic)
 │   ├── fetch_data.py        Historical data downloader (Binance REST API; caches to <root>/data)
 │   └── visualize.py         Equity curve + trade marker charts
 │
 ├── scripts/                 ── Analytical / diagnostic utilities ──
+│   ├── backtest_1h.py           Primary multi/single-asset backtest (domain profiles, STEP trail)
 │   ├── grid_trail_search.py     TRAIL grid search (PF+MAR growth lens)
 │   ├── grid_trail_analysis.py   TRAIL grid (capital-preservation lens + RISK sweep)
 │   ├── sweep_assets.py          Multi-asset ATR_RATIO out-of-sample sweep
@@ -814,8 +980,10 @@ trading-bot/
 │   └── probe_ws.py              Standalone Binance WS connectivity probe
 │
 ├── tests/                   ── Parity & regression suites (NO pytest; standalone runners) ──
-│   ├── test_trail_parity.py     Live/backtest trailing-stop parity (sync contract)
+│   ├── test_trail_parity.py     Live/backtest trailing-stop parity (incl. STEP ladder)
 │   ├── test_trail_dedupe.py     Live SL one-tick dedupe guard
+│   ├── test_order_manager.py    Cross-asset margin arbitration (incl. concurrent gather)
+│   ├── test_ws_fanout.py        Multi-symbol WebSocket fan-out routing
 │   ├── test_signal_diagnostics.py  Entry-funnel diagnostic drift guard
 │   └── test_sweep_assets.py     Unit tests for sweep_assets.py
 │
@@ -823,9 +991,9 @@ trading-bot/
 ├── docker-compose.yml       Named volumes, restart policy, log rotation
 ├── .dockerignore            Excludes .env, data/, __pycache__ from build context
 │
-├── data/
-│   ├── btcusdt_1h.csv       Cached 1H OHLCV (Sep 2019 → present, auto-updated)
-│   └── btcusdt_5m.csv       Cached 5M OHLCV (Sep 2019 → present, auto-updated)
+├── data/                    Per-symbol 1H + 5M OHLCV CSV cache (auto-fetched & updated)
+│   ├── btcusdt_1h.csv / btcusdt_5m.csv      (Sep 2019 → present)
+│   └── ethusdt_*.csv / solusdt_*.csv        (created on first multi-asset backtest)
 │
 ├── backtest_results/
 │   └── report.png           Equity curve chart from last backtest run
@@ -846,7 +1014,7 @@ trading-bot/
 
 - Always run in **paper trading mode first** (`PAPER_TRADING=true`) for at least 24–48 hours to verify your setup
 - The 1H breakout strategy fires approximately **15–40 signals per year** — do not expect a trade every day
-- With `RISK_PERCENT=8%` (production default): every stop-loss always costs exactly **8% of your balance**, regardless of volatility. At $1k balance that is $80 per SL; at $10k balance it is $800 per SL.
+- The shipped default `RISK_PERCENT=4%`: every stop-loss always costs exactly **4% of your balance**, regardless of volatility (at $1k that is $40 per SL). The §2 flagship tables use the max-growth `8%` setting (double the per-SL loss, higher CAGR and deeper drawdowns) — opt into it deliberately by raising the literal in `config_1h.py`.
 - The strategy's worst drawdown in 6 years was **−53%** (both WFO and Classic). Ensure you can withstand this before running live.
 - Year 1 of the backtest (Sep 2019 – Sep 2020) lost −38% — this reflects the COVID crash and early BTC futures market structure, not a repeating annual pattern.
 - **Start with a small balance** (e.g., $200–500 USDT) and scale up only after validating live performance over several months

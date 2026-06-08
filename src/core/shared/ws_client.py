@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable, Coroutine, Optional
+from dataclasses import dataclass
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 import websockets
 
@@ -30,6 +31,34 @@ _RECONNECT_DELAY: int = 5
 
 # Type alias for async callbacks
 _AsyncCallback = Callable[..., Coroutine[Any, Any, None]]
+
+
+@dataclass
+class Route:
+    """Per-symbol destination for fanned-out stream frames.
+
+    Bundles the symbol's own :class:`MarketState` and its three close/tick callbacks
+    so one shared socket can drive many independent asset processors.
+    """
+    state: MarketState
+    on_5m_close: Optional[_AsyncCallback] = None
+    on_1h_close: Optional[_AsyncCallback] = None
+    on_tick: Optional[_AsyncCallback] = None
+
+
+def build_stream_url(symbols: List[str]) -> str:
+    """Build the Binance combined-stream URL for every symbol's 4 streams.
+
+    Mirrors the single-symbol ``config.WS_URL`` layout (kline_5m / kline_1h /
+    markPrice / aggTrade) and concatenates the streams for all ``symbols`` so one
+    connection feeds the whole multi-asset book.  The 5M kline is streamed/cached
+    for intra-hour granularity; live SL/TP trailing itself runs per markPrice tick.
+    """
+    parts: List[str] = []
+    for sym in symbols:
+        s = sym.lower()
+        parts += [f"{s}@kline_5m", f"{s}@kline_1h", f"{s}@markPrice", f"{s}@aggTrade"]
+    return "wss://fstream.binance.com/market/stream?streams=" + "/".join(parts)
 
 
 class BinanceWS:
@@ -48,11 +77,26 @@ class BinanceWS:
 
     def __init__(
         self,
-        state: MarketState,
-        on_5m_close: _AsyncCallback,
+        state: Optional[MarketState] = None,
+        on_5m_close: Optional[_AsyncCallback] = None,
         on_1h_close: Optional[_AsyncCallback] = None,
         on_tick: Optional[_AsyncCallback] = None,
+        *,
+        routes: Optional[Dict[str, Route]] = None,
+        ws_url: Optional[str] = None,
     ) -> None:
+        # Two construction modes:
+        #   • Legacy single-symbol: pass state + callbacks → one implicit route keyed
+        #     by config.SYMBOL, connecting to config.WS_URL.  Behaviour is unchanged.
+        #   • Multi-asset: pass ``routes={SYMBOL: Route(...)}`` → frames are dispatched
+        #     by the symbol parsed from each stream name; URL covers all routed symbols.
+        if routes is not None:
+            self._routes: Dict[str, Route] = {s.upper(): r for s, r in routes.items()}
+            self.ws_url = ws_url or build_stream_url(list(self._routes))
+        else:
+            self._routes = {config.SYMBOL.upper(): Route(state, on_5m_close, on_1h_close, on_tick)}
+            self.ws_url = ws_url or config.WS_URL
+        # Back-compat attributes for the single-symbol callers that read them.
         self.state = state
         self.on_5m_close = on_5m_close
         self.on_1h_close = on_1h_close
@@ -91,9 +135,9 @@ class BinanceWS:
 
     async def _connect(self) -> None:
         """Open a WebSocket connection and process messages until it closes."""
-        logger.info(f"Connecting to {config.WS_URL}")
+        logger.info(f"Connecting to {self.ws_url}")
         async with websockets.connect(
-            config.WS_URL,
+            self.ws_url,
             ping_interval=20,
             ping_timeout=20,
             close_timeout=10,
@@ -128,28 +172,39 @@ class BinanceWS:
         stream: str = msg.get("stream", "")
         data: dict = msg.get("data", {})
 
-        if "@kline_5m" in stream:
+        # Route by the symbol prefix of the stream name (e.g. "ethusdt@kline_1h" →
+        # ETHUSDT).  Always present on data streams; control frames have no "@".
+        symbol = stream.split("@", 1)[0].upper() if "@" in stream else ""
+        route = self._routes.get(symbol)
+
+        if route is not None and "@kline_5m" in stream:
+            # Always cache the fine-grained 5M data into buf_5m (streaming/caching
+            # alongside 1H), regardless of whether a close-callback is registered.
+            # NOTE: live SL/TP trailing does NOT depend on this — it runs per
+            # markPrice tick (see the @markPrice branch).  The 5M cache is available
+            # for intra-hour analysis and any future 5M consumer.
             kline = data.get("k", {})
-            if self.state.buf_5m.update(kline):
+            closed = route.state.buf_5m.update(kline)
+            if closed and route.on_5m_close is not None:
                 logger.debug(
-                    f"5M candle closed  close={kline['c']}  "
-                    f"buf_5m={self.state.buf_5m.count}"
+                    f"[{symbol}] 5M candle closed  close={kline.get('c')}  "
+                    f"buf_5m={route.state.buf_5m.count}"
                 )
-                await self.on_5m_close(self.state)
+                await route.on_5m_close(route.state)
 
-        elif "@kline_1h" in stream:
+        elif route is not None and "@kline_1h" in stream:
             kline = data.get("k", {})
-            if self.state.buf_1h.update(kline) and self.on_1h_close:
-                logger.debug(f"1H candle closed  close={kline['c']}")
-                await self.on_1h_close(self.state)
+            if route.state.buf_1h.update(kline) and route.on_1h_close:
+                logger.debug(f"[{symbol}] 1H candle closed  close={kline['c']}")
+                await route.on_1h_close(route.state)
 
-        elif "@markPrice" in stream:
-            self.state.update_mark_price(data)
-            if self.on_tick:
-                await self.on_tick(self.state, self.state.mark_price)
+        elif route is not None and "@markPrice" in stream:
+            route.state.update_mark_price(data)
+            if route.on_tick:
+                await route.on_tick(route.state, route.state.mark_price)
 
-        elif "@aggTrade" in stream:
-            self.state.update_agg_trade(data)
+        elif route is not None and "@aggTrade" in stream:
+            route.state.update_agg_trade(data)
 
         else:
             # No matching stream branch. This catches Binance control frames

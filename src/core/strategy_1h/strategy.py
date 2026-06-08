@@ -25,7 +25,7 @@ from typing import Dict, Optional
 
 import numpy as np
 
-import config
+import config_1h as config   # 1H strategy owns its params (config_1h.py)
 import indicators as ind
 from adaptive_regime import RegimeState, compute_adaptive_regime
 from data_store import MarketState

@@ -16,11 +16,10 @@ Startup sequence
 4. ``state.buf_1h`` is pre-seeded with the last 600 historical bars so that
    indicators (EMA, RSI, ADX) are warm on the very first live candle.
 
-Three callbacks
----------------
+Callbacks
+---------
 ``on_1h_close``  — evaluates the breakout signal, updates WFO / forecaster,
                    persists state, opens a position when conditions are met.
-``on_5m_close``  — reserved for future 5M logic.
 ``on_tick``      — mark-price SL/TP monitoring and heartbeat.
 
 Usage::
@@ -43,22 +42,36 @@ from typing import Optional
 # `import config` / `from trader import …` style resolves after the restructure. ─
 import pathlib
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
 
-import config
+import config_1h as config   # orchestrator reads/writes the 1H strategy config
 import notifier
 import strategy
+from asset_processor import AssetProcessor
+from btc.processor import Processor as BtcProcessor
+from eth.processor import Processor as EthProcessor
+from sol.processor import Processor as SolProcessor
+
+# Feature-based domain processors (each a thin shell over the shared 1H engine).
+# main spins up the enabled SECONDARY symbols from this registry; the primary
+# (config.SYMBOL) keeps its proven WFO-driven on_1h_close path.
+_DOMAIN_PROCESSORS = {
+    "BTCUSDT": BtcProcessor,
+    "ETHUSDT": EthProcessor,
+    "SOLUSDT": SolProcessor,
+}
 from backtest import StrategyState
 from data_store import MarketState
+from order_manager import OrderManager
 from regime_forecast import MarkovRegimeForecaster
 from state_manager import StateManager
 from trader import Trader
 from walk_forward_optimizer import WalkForwardOptimizer
 from warm_start import LiveHistory, WarmStart
-from ws_client import BinanceWS
+from ws_client import BinanceWS, Route
 
 logging.basicConfig(
     level=logging.INFO,
@@ -336,6 +349,7 @@ async def on_1h_close(mstate: MarketState) -> None:
         config.BREAKOUT_PERIOD = _strat_state.active_bp
 
     sig = strategy.evaluate_1h_live(mstate, _bars_since_last_1h)
+
     if sig:
         # Apply forecast size scale on top of regime scale from the signal
         if config.REGIME_FORECAST_ENABLED:
@@ -455,15 +469,6 @@ def _maybe_save_state() -> None:
 # Callbacks (continued)
 # ---------------------------------------------------------------------------
 
-async def on_5m_close(mstate: MarketState) -> None:
-    """Handle a closed 5M candle event (stub — reserved for future use).
-
-    Args:
-        mstate: Current :class:`~data_store.MarketState`.
-    """
-    pass
-
-
 async def on_tick(mstate: MarketState, price: float) -> None:
     """Handle every mark-price tick — SL/TP/trail monitoring and housekeeping.
 
@@ -530,7 +535,6 @@ async def on_tick(mstate: MarketState, price: float) -> None:
 
 ws = BinanceWS(
     state=state,
-    on_5m_close=on_5m_close,
     on_1h_close=on_1h_close,
     on_tick=on_tick,
 )
@@ -615,6 +619,16 @@ async def main() -> None:
     then runs :meth:`~ws_client.BinanceWS.run` until cancelled or stopped.
     Prints a final session summary on exit.
     """
+    # Profit-locking STEP trail is the production live exit logic (opt-in flag, off in
+    # config so backtest/grid tools keep their classic trail — turned on here for live).
+    config.STEP_TRAILING_ENABLED = True
+    # Apply this symbol's per-asset 1H profile from the CONFIG_MATRIX (breakout / ADX /
+    # TP / SL / trail-activate).  No-op for symbols not in the matrix (flat defaults
+    # retained).  Must run before the banner so it reflects the active profile.
+    if config.apply_symbol(config.SYMBOL):
+        logger.info(f"Applied CONFIG_MATRIX profile for {config.SYMBOL}")
+    logger.info("Trailing regime: profit-locking STEP ladder (BE → +1ATR → +2ATR …)")
+
     mode = "PAPER" if config.PAPER_TRADING else "LIVE"
     risk_label = (f"RISK_USD=${config.RISK_USD:.0f}" if config.RISK_USD > 0
                   else f"RISK_PCT={config.RISK_PERCENT}%")
@@ -745,7 +759,55 @@ async def main() -> None:
     WarmStart.print_summary(warm)
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # MULTI-ASSET FAN-OUT (additive — proven primary path untouched)
+    # ══════════════════════════════════════════════════════════════════════════
+    # Every ENABLED symbol other than the primary (config.SYMBOL) gets its own
+    # AssetProcessor fed by the SAME socket via a per-symbol Route.  The primary keeps
+    # its exact proven handlers (state / on_1h_close / on_tick + WFO).  Secondaries
+    # snapshot+restore the shared config around their evaluate, so the primary's
+    # WFO-driven config is never disturbed.  If no secondaries are enabled we keep the
+    # original single-symbol socket verbatim.
+    global ws
+    _secondaries = [s for s in config.enabled_symbols() if s != config.SYMBOL]
+    if _secondaries:
+        # Build each enabled secondary from its feature-based domain processor
+        # (falls back to a generic AssetProcessor if a symbol has no domain module).
+        processors = [
+            _DOMAIN_PROCESSORS.get(sym, lambda order_manager=None, _s=sym:
+                                   AssetProcessor(_s, order_manager=order_manager))(order_manager=None)
+            for sym in _secondaries
+        ]
+        # Global margin budget = total capital across every LIVE sleeve (primary +
+        # secondaries).  In paper each sleeve runs its own simulated balance; in live
+        # against one real account these all read the same equity.
+        _live_traders = [trader] + [p.trader for p in processors if p.trader is not None]
+        order_mgr = OrderManager(balance_provider=lambda: sum(t.balance for t in _live_traders))
+        for proc in processors:
+            proc.order_manager = order_mgr
+        for proc in processors:
+            await proc.warm_start()
+        routes = {config.SYMBOL: Route(state=state,
+                                       on_1h_close=on_1h_close, on_tick=on_tick)}
+        for proc in processors:
+            routes[proc.symbol] = Route(state=proc.state, on_1h_close=proc.on_1h_close,
+                                        on_tick=proc.on_tick)
+        ws = BinanceWS(routes=routes)
+        logger.info("Multi-asset fan-out ACTIVE on one shared socket — primary=%s  "
+                    "secondaries=[%s]", config.SYMBOL,
+                    ", ".join(f"{p.symbol}:{p.mode}" for p in processors))
+        live_syms = [s for s in config.enabled_symbols() if config.trade_mode(s) == "LIVE"]
+        if len(live_syms) > 1:
+            logger.warning("Multiple LIVE symbols (%s) — concurrent LIVE trail management "
+                           "through shared config is paper-pending; recommend one LIVE symbol.",
+                           ", ".join(live_syms))
+    else:
+        logger.info("Single-asset mode — only %s enabled (proven path, no fan-out).",
+                    config.SYMBOL)
+
     try:
+        # The shared WebSocket feed drives the whole 1H book: the primary symbol via
+        # on_1h_close and each enabled secondary via its AssetProcessor route.
         await ws.run()
     except asyncio.CancelledError:
         pass

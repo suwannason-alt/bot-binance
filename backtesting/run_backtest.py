@@ -40,7 +40,7 @@ from __future__ import annotations
 import sys
 import pathlib
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
@@ -54,7 +54,7 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 import backtest
-import config
+import config_1h as config   # CLI overrides must write where backtest.py reads
 import fetch_data
 import visualize
 
@@ -106,6 +106,9 @@ _BASE: Dict = {
     "TRAIL_ACTIVATE_ATR":      1.5,
     "TRAIL_LOCK_ATR":          0.0,
     "TRAIL_STOP_ATR":          0.0,
+    "STEP_TRAILING_ENABLED":   False,  # _BASE = reproducible classic profile; STEP is
+                                       # opt-in (live default + portfolio runner only).
+
     "ATR_RATIO_MIN":           1.10,
     "EMA_SLOPE_MIN_PCT":       0.15,
     "VOL_RATIO_MIN":           0.3,

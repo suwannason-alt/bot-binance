@@ -39,12 +39,12 @@ import pandas as pd
 # Adjust sys.path (modular layout) so this script resolves the flat `import config`
 # style from any working directory: add repo root + src/core + backtesting + scripts.
 _ROOT = Path(__file__).resolve().parents[1]
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_ROOT / _seg) if _seg else str(_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
 
-import config
+import config_1h as config   # warm-up check reads the 1H strategy indicator params
 import indicators as ind
 from adaptive_regime import hurst_exponent
 

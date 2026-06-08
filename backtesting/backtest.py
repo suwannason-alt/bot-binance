@@ -17,7 +17,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-import config
+import config_1h as config   # backtest engine reads the 1H strategy config
 import indicators as ind
 from adaptive_regime import compute_adaptive_regime, hurst_exponent
 from regime_forecast import MarkovRegimeForecaster, RegimeForecast
@@ -410,15 +410,71 @@ def _apply_adaptive_trail(position: _OpenPosition, bar_high: float, bar_low: flo
         position.sl = trail_price
 
 
+def _apply_step_trail(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
+    """Profit-based STEP trailing — mirrors ``trader._apply_step_trail`` exactly.
+
+    A monotonic profit-locking ladder (capital-preservation / max-win-rate regime):
+
+      * Once favourable excursion reaches ``TRAIL_ACTIVATE_ATR × ATR`` the SL steps
+        to **break-even** (locks 0 profit, removes downside).
+      * Every *additional* full ``1.0 × ATR`` of favourable excursion ratchets the SL
+        forward by another ``1.0 × ATR`` of locked profit (BE → +1ATR → +2ATR → …),
+        truncating the long-tail give-back.
+
+    Stateless: the locked level is recomputed from the current favourable excursion
+    each call and applied through a ratchet (SL only ever moves in the favourable
+    direction), so a pullback can block — never lower — the stop, and no per-step
+    position state is required.  ``TRAIL_LOCK_ATR`` / ``TRAIL_STOP_ATR`` are unused.
+
+    Args:
+        position: The open position to modify in-place.
+        bar_high: Current bar's high price (favour reference for LONG).
+        bar_low:  Current bar's low price  (favour reference for SHORT).
+    """
+    atr      = position.entry_atr
+    entry    = position.entry_price
+    activate = config.TRAIL_ACTIVATE_ATR
+    is_long  = position.side == "LONG"
+    price    = bar_high if is_long else bar_low
+
+    favour = (price - entry) if is_long else (entry - price)
+    if activate <= 0 or favour < activate * atr:
+        return
+
+    # Past the activation gate the stop is at break-even or better — flag it so the
+    # exit labeller buckets a ratcheted stop-out as "BE" (a profit-locked exit), not
+    # "SL".  Backtest-only bookkeeping: it does not feed the SL math below, so live
+    # parity (which compares only the stop price) is unaffected.
+    position.be_activated = True
+
+    # steps = full TRAIL_STEP_ATR increments locked beyond break-even (0 at BE, +1 at
+    # activate+step…).  step=1.0 reproduces the legacy BE→+1ATR→+2ATR ladder exactly.
+    step   = getattr(config, "TRAIL_STEP_ATR", 1.0) or 1.0
+    steps  = int((favour / atr - activate) / step + 1e-9)
+    locked = steps * step * atr
+    new_sl = (entry + locked) if is_long else (entry - locked)
+
+    if is_long and new_sl > position.sl:
+        position.sl = new_sl
+    elif not is_long and new_sl < position.sl:
+        position.sl = new_sl
+
+
 def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: float) -> None:
     """Dispatch trailing-stop logic to the correct implementation.
+
+    Dispatch order (first enabled wins): ``STEP_TRAILING_ENABLED`` →
+    ``ADAPTIVE_TRAILING_ENABLED`` → classic cascade.
+
+    When ``STEP_TRAILING_ENABLED`` is ``True``, delegates to
+    :func:`_apply_step_trail` (profit-locking 1×ATR ladder).
 
     When ``ADAPTIVE_TRAILING_ENABLED`` is ``True``, delegates to
     :func:`_apply_adaptive_trail`, which replaces all three classic stages with
     a single continuous tightening funnel.
 
-    When ``ADAPTIVE_TRAILING_ENABLED`` is ``False`` (default), delegates to
-    :func:`_apply_classic_trail` (break-even → profit lock → dynamic trail).
+    Otherwise (default) delegates to :func:`_apply_classic_trail`
+    (break-even → profit lock → dynamic trail).
 
     Args:
         position: The open position to modify in-place.
@@ -428,7 +484,9 @@ def _update_trailing_stop(position: _OpenPosition, bar_high: float, bar_low: flo
     if position.entry_atr <= 0:
         return
 
-    if config.ADAPTIVE_TRAILING_ENABLED:
+    if getattr(config, "STEP_TRAILING_ENABLED", False):
+        _apply_step_trail(position, bar_high, bar_low)
+    elif config.ADAPTIVE_TRAILING_ENABLED:
         _apply_adaptive_trail(position, bar_high, bar_low)
     else:
         _apply_classic_trail(position, bar_high, bar_low)
@@ -495,6 +553,7 @@ def run(
         summary statistics, and a daily PnL series.
     """
     # ── 5M indicator arrays ──────────────────────────────────────────────────
+    o5 = df_5m["open"].values
     h5 = df_5m["high"].values
     l5 = df_5m["low"].values
     c5 = df_5m["close"].values
@@ -569,6 +628,15 @@ def run(
     last_trade_5m_bar: int = -9999
     prev_1h_bar: int = -1
     _first_valid_j: int = -1     # first 1H bar that passes all NaN guards (cooldown anchor)
+    n_1h: int = len(c1)
+
+    # ── Multi-timeframe (mtf_stop) cached 1H context ─────────────────────────
+    # Re-derived only when a new 1H bar closes; reused across the ~12 intervening
+    # 5M bars.  ``mtf_side`` is the armed resting-stop direction (None = no order).
+    mtf_j:         int   = -1
+    mtf_side:      Optional[str] = None
+    mtf_threshold: float = 0.0       # resting STOP_MARKET trigger level (≥ market when armed)
+    mtf_atr:       float = 0.0       # cached 1H ATR for SL/TP sizing
 
     # ── Daily tracking ────────────────────────────────────────────────────────
     current_day_epoch: int = -1
@@ -832,6 +900,169 @@ def run(
                             indicators_5m={}, indicators_1h={},
                         )
                         last_daily_entry_day = bar_day
+
+        elif mode in ("mtf_stop", "mtf_close"):
+            # ══════════════════════════════════════════════════════════════════
+            # CHALLENGER — Multi-timeframe trigger + resting breakout STOP_MARKET
+            #
+            # ``mtf_close`` is a single-variable diagnostic twin of ``mtf_stop``:
+            # identical 1H filter + 5M RSI/vol funnel, but the breakout is
+            # confirmed by a 5M *close* beyond the level (filled at that close)
+            # instead of an intrabar *touch* (filled at the level).  Comparing
+            # the two isolates the fill/trigger mechanism from the funnel change.
+            # ──────────────────────────────────────────────────────────────────
+            # 1H = FILTER layer (cached at each 1H close): trend bias (EMA20/50 +
+            #      EMA200 position + EMA200 slope), ADX, ATR-expansion, ATR% bounds.
+            #      Defines the armed direction + the resting-stop trigger level.
+            # 5M = TRIGGER layer (every 5M close): RSI / volume / ATR% funnel, and
+            #      the resting STOP_MARKET that fills the instant 5M price action
+            #      touches the cached breakout level — Binance-side execution.
+            #
+            # Resting-stop legitimacy invariant (asserted below):
+            #   threshold = roll_high[j+1] = max(high[j-N+1 .. j]) ≥ high[j] ≥ c1[j]
+            #   so a BUY-stop is ALWAYS at/above market when armed (mirror for SELL).
+            #   This captures the SAME breakouts baseline tests at the close of bar
+            #   j+1 — but filled at the level mid-bar instead of at the 1H close.
+            # ══════════════════════════════════════════════════════════════════
+            if j < config.MIN_CANDLES_1H or j + 1 >= n_1h:
+                continue
+
+            # ── Re-derive cached 1H context only when a new 1H bar closes ───────
+            if j != mtf_j:
+                mtf_j    = j
+                mtf_side = None
+
+                # WFO retune (independent instance — mirrors baseline cadence)
+                if config.WFO_ENABLED and wfo is not None and wfo.should_retune(j):
+                    _cur_atr = float(atr_1h[j]) if not np.isnan(atr_1h[j]) else None
+                    _wfo_params = wfo.optimize(
+                        c1=c1, h1=h1, l1=l1,
+                        adx_arr=adx_1h, atr_arr=atr_1h,
+                        end_bar=j, current_atr=_cur_atr,
+                    )
+                    strat_state.active_bp = _wfo_params.breakout_period
+                    logger.info(
+                        "WFO retune @ 1H bar %d: BP=%d  PF=%.2f  n_trades=%d",
+                        j, _wfo_params.breakout_period,
+                        _wfo_params.profit_factor, _wfo_params.n_trades,
+                    )
+                    del _wfo_params, _cur_atr
+                    gc.collect()
+
+                _ef, _es, _et = ema_fast_1h[j], ema_slow_1h[j], ema_trend_1h[j]
+                if not any(np.isnan(v) for v in (_ef, _es, _et, atr_1h[j])) and c1[j] > 0:
+                    _atr_pct_1h = float(atr_1h[j]) / float(c1[j]) * 100.0
+                    _sep        = abs(_ef - _es) / _es if _es else 0.0
+                    _atr_ratio  = (float(atr_1h[j] / atr_sma_1h[j])
+                                   if not np.isnan(atr_sma_1h[j]) and atr_sma_1h[j] > 0 else None)
+                    _adx        = float(adx_1h[j]) if not np.isnan(adx_1h[j]) else None
+
+                    # EMA200 slope (same lookback/threshold as baseline)
+                    _js    = j - config.EMA_TREND_SLOPE_BARS
+                    _etp   = (float(ema_trend_1h[_js])
+                              if _js >= 0 and not np.isnan(ema_trend_1h[_js]) else None)
+                    if config.EMA_SLOPE_MIN_PCT > 0 and _etp is not None:
+                        _need    = _et * (config.EMA_SLOPE_MIN_PCT / 100.0)
+                        _rising  = (_et - _etp) >= _need
+                        _falling = (_etp - _et) >= _need
+                    else:
+                        _rising  = _etp is None or _et >= _etp
+                        _falling = _etp is None or _et <= _etp
+
+                    _dist     = (c1[j] - _et) / _et * 100.0
+                    _long_ok_dist  =   _dist  >= config.EMA_TREND_DISTANCE_MIN
+                    _short_ok_dist = (-_dist) >= config.EMA_TREND_DISTANCE_MIN
+
+                    # 1H regime gates (sep / ATR-expansion / ATR% / ADX)
+                    _regime_ok = (
+                        _sep >= config.EMA_1H_MIN_SEP
+                        and (config.ATR_1H_PCT_MIN < _atr_pct_1h < config.ATR_1H_PCT_MAX)
+                        and not (config.ATR_RATIO_MIN > 0 and _atr_ratio is not None
+                                 and _atr_ratio < config.ATR_RATIO_MIN)
+                        and not (config.ADX_MIN > 0 and _adx is not None
+                                 and _adx < config.ADX_MIN)
+                    )
+
+                    if _regime_ok:
+                        _active_bp = strat_state.active_bp if config.WFO_ENABLED else config.BREAKOUT_PERIOD
+                        _rh = roll_high_grid.get(_active_bp, roll_high_1h)
+                        _rl = roll_low_grid.get(_active_bp, roll_low_1h)
+                        _buf = float(atr_1h[j]) * config.BREAKOUT_ATR_BUFFER
+
+                        if _ef > _es and _long_ok_dist and _rising and not np.isnan(_rh[j + 1]):
+                            _thr = float(_rh[j + 1]) + _buf
+                            if _thr >= c1[j]:                 # invariant — must hold
+                                mtf_side, mtf_threshold = "LONG", _thr
+                            else:
+                                logger.warning("mtf_stop LONG threshold %.2f < close %.2f @ j=%d",
+                                               _thr, c1[j], j)
+                        elif _ef < _es and _short_ok_dist and _falling and not np.isnan(_rl[j + 1]):
+                            _thr = float(_rl[j + 1]) - _buf
+                            if _thr <= c1[j]:                 # invariant — must hold
+                                mtf_side, mtf_threshold = "SHORT", _thr
+                            else:
+                                logger.warning("mtf_stop SHORT threshold %.2f > close %.2f @ j=%d",
+                                               _thr, c1[j], j)
+                        mtf_atr = float(atr_1h[j])
+
+            if mtf_side is None:
+                continue
+
+            # ── 5M cooldown ────────────────────────────────────────────────────
+            if i - last_trade_5m_bar < config.TRADE_COOLDOWN_5M:
+                continue
+
+            # ── 5M funnel (RSI / volume / ATR%) on the current 5M bar ──────────
+            if np.isnan(rsi_5m[i]) or np.isnan(atr_5m[i]) or c5[i] <= 0:
+                continue
+            _atr_pct_5m = float(atr_5m[i]) / float(c5[i]) * 100.0
+            if not (config.ATR_1H_PCT_MIN < _atr_pct_5m < config.ATR_1H_PCT_MAX):
+                continue
+            _vr5 = (float(v5[i] / vol_sma_5m[i])
+                    if not np.isnan(vol_sma_5m[i]) and vol_sma_5m[i] > 0 else None)
+            if _vr5 is not None and _vr5 < config.VOL_RATIO_MIN:
+                continue
+
+            # ── Resting STOP_MARKET trigger — intrabar touch of the level ──────
+            _close_confirm = (mode == "mtf_close")
+            if mtf_side == "LONG":
+                if not (config.RSI_1H_LONG_MIN <= rsi_5m[i] <= config.RSI_1H_LONG_MAX):
+                    continue
+                if _close_confirm:
+                    if c5[i] <= mtf_threshold:    # require a 5M CLOSE beyond the level
+                        continue
+                    _fill = float(c5[i])          # fill at the confirming close
+                else:
+                    if h5[i] < mtf_threshold:     # intrabar TOUCH of the level
+                        continue
+                    _fill = max(mtf_threshold, float(o5[i]))   # gap-through fills at open
+                _sl   = _fill - config.ATR_SL_MULTIPLIER * mtf_atr
+                _tp   = _fill + config.ATR_TP_MULTIPLIER * mtf_atr
+            else:  # SHORT
+                if not (config.RSI_1H_SHORT_MIN <= rsi_5m[i] <= config.RSI_1H_SHORT_MAX):
+                    continue
+                if _close_confirm:
+                    if c5[i] >= mtf_threshold:
+                        continue
+                    _fill = float(c5[i])
+                else:
+                    if l5[i] > mtf_threshold:
+                        continue
+                    _fill = min(mtf_threshold, float(o5[i]))
+                _sl   = _fill + config.ATR_SL_MULTIPLIER * mtf_atr
+                _tp   = _fill - config.ATR_TP_MULTIPLIER * mtf_atr
+
+            _sl_dist = abs(_fill - _sl)
+            _tp_dist = abs(_tp - _fill)
+            signal = Signal(
+                side=mtf_side, entry=_fill, sl=_sl, tp=_tp,
+                sl_pct=_sl_dist / _fill * 100, tp_pct=_tp_dist / _fill * 100,
+                rr_ratio=round(_tp_dist / _sl_dist, 2) if _sl_dist > 0 else 0,
+                reason=f"{mtf_side} mtf_stop|trig={mtf_threshold:.2f} rsi5={rsi_5m[i]:.1f}",
+                regime="UNKNOWN", size_scale=1.0,
+                indicators_5m={}, indicators_1h={},
+            )
+            mtf_side = None   # consume the resting order until the next 1H re-arm
 
         else:
             # Default: "1h" mode — evaluate only on each new 1H bar close
@@ -1097,6 +1328,7 @@ def run(
             entry_atr=float(atr_1h[j]),
         )
         last_trade_1h_bar = j
+        last_trade_5m_bar = i      # 5M-granularity cooldown anchor (mtf_stop mode)
 
     # ── Force-close any open position at end of data ──────────────────────────
     if position is not None:
@@ -1261,3 +1493,112 @@ def _compute_stats(
         "days_profit_hit":  days_profit_hit,
         "days_loss_hit":    days_loss_hit,
     }
+
+
+# ---------------------------------------------------------------------------
+# Multi-asset portfolio execution (composite 1H run — STEP-trailing regime)
+# ---------------------------------------------------------------------------
+
+def run_portfolio(
+    datasets: "Dict[str, Tuple[pd.DataFrame, pd.DataFrame]]",
+    initial_balance_per_asset: float = 1000.0,
+    risk_percent: float = 0.5,
+) -> Dict:
+    """Run a composite multi-asset 1H backtest under the profit-locking STEP trail.
+
+    Each symbol trades as an **independent capital sleeve** — its own
+    ``initial_balance_per_asset`` sized at ``RISK_PERCENT`` of *that sleeve's* running
+    balance (matching the spec's "RISK_PERCENT per asset").  This reuses the proven,
+    parity-validated single-symbol :func:`run` once per asset rather than building a
+    shared-capital concurrent fill engine (which has no existing infrastructure and
+    would be a fresh lookahead surface).  Per-symbol tuning comes from
+    :func:`config_1h.apply_symbol`; the shared safety profile (STEP trail ON, WFO OFF
+    so the hardcoded per-symbol breakout is honored, daily caps OFF for clean
+    compounding) is pinned here before each sleeve runs.
+
+    The portfolio is then aggregated honestly: per-sleeve equity curves are reindexed
+    onto the **union** of all 1H timestamps and forward-filled before summing, so the
+    portfolio MaxDD reflects simultaneous holding; PF and win-rate pool every trade.
+
+    Args:
+        datasets:                   ``{symbol: (df_5m, df_1h)}`` — pre-fetched per asset.
+        initial_balance_per_asset:  Starting balance for *each* sleeve (default $1 000).
+        risk_percent:               RISK_PERCENT applied per sleeve (default 0.5).
+
+    Returns:
+        ``{"sleeves": {symbol: BacktestResult}, "rows": {symbol: dict}, "portfolio":
+        dict, "equity": pd.Series}`` — ``rows``/``portfolio`` carry the deliverable
+        columns (trades, win_rate, profit_factor, max_drawdown_pct, net_profit, ...).
+    """
+    sleeves: Dict[str, BacktestResult] = {}
+    rows: Dict[str, Dict] = {}
+
+    for symbol, (df5, df1) in datasets.items():
+        # ── Shared safety profile (pinned per sleeve so order can't leak state) ──
+        config.STEP_TRAILING_ENABLED     = True   # profit-locking ladder regime
+        config.ADAPTIVE_TRAILING_ENABLED = False
+        config.WFO_ENABLED               = False  # honor hardcoded per-symbol BREAKOUT
+        config.EQUITY_PERCENT            = 0.0
+        config.RISK_PERCENT              = risk_percent
+        config.ORDER_BALANCE_USD         = 0.0
+        config.RISK_USD                  = 0.0
+        config.DAILY_PROFIT_TARGET_USD   = 0.0
+        config.DAILY_LOSS_LIMIT_USD      = 0.0
+        config.DAILY_PROFIT_TARGET_PCT   = 0.0
+        config.DAILY_LOSS_LIMIT_PCT      = 0.0
+        # ── Per-symbol tuned knobs from the CONFIG_MATRIX ────────────────────────
+        if not config.apply_symbol(symbol):
+            raise ValueError(f"{symbol!r} is not defined in config_1h.CONFIG_MATRIX")
+        config.MIN_CANDLES_1H = max(config.MIN_CANDLES_1H, config.EMA_TREND + 10)
+
+        res = run(df5, df1, initial_balance=initial_balance_per_asset, mode="1h")
+        sleeves[symbol] = res
+        s = res.stats
+        rows[symbol] = {
+            "trades":           s["total_trades"],
+            "win_rate":         s["win_rate"],
+            "profit_factor":    s["profit_factor"],
+            "max_drawdown_pct": s["max_drawdown_pct"],
+            "net_profit":       s["final_balance"] - initial_balance_per_asset,
+            "final_balance":    s["final_balance"],
+            "cagr_pct":         s["cagr_pct"],
+            "tp_exits":         s["tp_exits"],
+            "sl_exits":         s["sl_exits"],
+            "be_exits":         s["be_exits"],
+        }
+
+    # ── Portfolio equity: union-index forward-fill, then sum sleeves ─────────────
+    union_idx = pd.DatetimeIndex(sorted(set().union(*[r.equity_curve.index for r in sleeves.values()])))
+    port_equity = None
+    for res in sleeves.values():
+        aligned = res.equity_curve.reindex(union_idx).ffill().fillna(initial_balance_per_asset)
+        port_equity = aligned if port_equity is None else port_equity + aligned
+    port_equity.name = "portfolio_balance"
+
+    roll_max = port_equity.cummax()
+    port_dd = float(((port_equity - roll_max) / roll_max).min() * 100.0)
+
+    # ── Pool every trade for portfolio PF / win-rate ────────────────────────────
+    all_pnls = [t.pnl for res in sleeves.values() for t in res.trades]
+    n_trades = len(all_pnls)
+    wins     = [p for p in all_pnls if p > 0]
+    gp       = sum(p for p in all_pnls if p > 0)
+    gl       = abs(sum(p for p in all_pnls if p < 0))
+    n_assets = len(sleeves)
+    start_eq = n_assets * initial_balance_per_asset
+    final_eq = float(port_equity.iloc[-1])
+    yrs      = max((port_equity.index[-1] - port_equity.index[0]).days / 365.25, 1e-9)
+
+    portfolio = {
+        "trades":           n_trades,
+        "win_rate":         (len(wins) / n_trades * 100.0) if n_trades else 0.0,
+        "profit_factor":    (gp / gl) if gl > 0 else float("inf"),
+        "max_drawdown_pct": port_dd,
+        "net_profit":       final_eq - start_eq,
+        "final_balance":    final_eq,
+        "initial_balance":  start_eq,
+        "cagr_pct":         ((final_eq / start_eq) ** (1.0 / yrs) - 1.0) * 100.0
+                            if start_eq > 0 and final_eq > 0 else -100.0,
+    }
+
+    return {"sleeves": sleeves, "rows": rows, "portfolio": portfolio, "equity": port_equity}

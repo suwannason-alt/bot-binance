@@ -91,7 +91,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-import config
+import config_1h as config   # warm-start hydrates the 1H WFO + forecaster
 import indicators as ind
 from adaptive_regime import hurst_exponent
 from backtest import StrategyState

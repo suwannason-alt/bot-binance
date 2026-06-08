@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-import config
+import config_1h as config   # the live order executor runs the 1H book
 from strategy import Signal, position_size_usdt
 
 logger = logging.getLogger("trader")
@@ -81,7 +81,14 @@ class Trader:
         consecutive_losses: Count of consecutive stop-loss exits (resets daily).
     """
 
-    def __init__(self):
+    def __init__(self, symbol: Optional[str] = None):
+        # Per-symbol binding for multi-asset live trading.  Defaults to the env
+        # ``config.SYMBOL`` so the single-asset path is byte-for-byte unchanged; a
+        # secondary-asset processor passes its own symbol so its exchange order calls
+        # route to the right market.  ``symbol_ccxt`` mirrors the old config.SYMBOL_CCXT
+        # 3-char-base slicing (BTCUSDT→BTC/USDT, ETHUSDT→ETH/USDT).
+        self.symbol: str = symbol or config.SYMBOL
+        self.symbol_ccxt: str = f"{self.symbol[:3]}/{self.symbol[3:]}"
         self.position: Optional[Position] = None
         self.balance: float = 1000.0  # paper balance; overwritten on live init
         self.trade_log: list[Position] = []
@@ -226,7 +233,7 @@ class Trader:
         try:
             positions = await loop.run_in_executor(
                 None,
-                lambda: self._exchange.fetch_positions([config.SYMBOL_CCXT]),
+                lambda: self._exchange.fetch_positions([self.symbol_ccxt]),
             )
             for p in positions:
                 contracts = float(p.get("contracts") or 0)
@@ -247,7 +254,7 @@ class Trader:
                 try:
                     open_orders = await loop.run_in_executor(
                         None,
-                        lambda: self._exchange.fetch_open_orders(config.SYMBOL_CCXT),
+                        lambda: self._exchange.fetch_open_orders(self.symbol_ccxt),
                     )
                     for o in open_orders:
                         if o.get("type") in ("stop_market", "stop") and o.get("reduceOnly"):
@@ -376,7 +383,7 @@ class Trader:
         regime_str = getattr(signal, "regime", "?")
         logger.info(
             f"[{'PAPER' if config.PAPER_TRADING else 'LIVE'}] "
-            f"Opening {signal.side} {qty:.4f} {config.SYMBOL} @ {signal.entry:.2f}  "
+            f"Opening {signal.side} {qty:.4f} {self.symbol} @ {signal.entry:.2f}  "
             f"SL={signal.sl:.2f}  TP={signal.tp:.2f}  "
             f"{risk_label}  regime={regime_str}  {signal.reason}"
         )
@@ -476,7 +483,7 @@ class Trader:
     async def _place_market_entry(self, signal: Signal, qty: float) -> Optional[str]:
         """Market-order entry (taker fee 0.05%). Reliable but more expensive."""
         loop    = asyncio.get_event_loop()
-        sym     = config.SYMBOL_CCXT
+        sym     = self.symbol_ccxt
         side_in = "buy" if signal.side == "LONG" else "sell"
 
         await self._set_leverage_safe(sym)
@@ -504,7 +511,7 @@ class Trader:
           → still open after full-timeout  : cancel, fall back to market order
         """
         loop     = asyncio.get_event_loop()
-        sym      = config.SYMBOL_CCXT
+        sym      = self.symbol_ccxt
         side_in  = "buy" if signal.side == "LONG" else "sell"
         limit_px = self._round_price(signal.entry)
 
@@ -631,9 +638,57 @@ class Trader:
         """
         if pos.initial_atr <= 0:
             return False
+        if getattr(config, "STEP_TRAILING_ENABLED", False):
+            return self._apply_step_trail(pos, price)
         if config.ADAPTIVE_TRAILING_ENABLED:
             return self._apply_adaptive_trail(pos, price)
         return self._apply_classic_trail(pos, price)
+
+    def _apply_step_trail(self, pos: Position, price: float) -> bool:
+        """Profit-based STEP trailing — mirrors ``backtest._apply_step_trail`` exactly.
+
+        Monotonic profit-locking ladder: SL steps to break-even once price moves
+        ``TRAIL_ACTIVATE_ATR × ATR`` in favour, then ratchets forward by ``1×ATR`` of
+        locked profit for every additional ``1×ATR`` of favourable excursion
+        (BE → +1ATR → +2ATR → …).  Stateless + ratcheted (SL never retreats), so no
+        per-step position state is needed.  ``TRAIL_LOCK/STOP`` are unused.
+
+        Live mode sees only the current mark ``price`` (no intrabar high/low), so
+        ``price`` drives the favour calc — identical to the single-price classic
+        live trail, and to the backtest under ``bar_high == bar_low == price``.
+
+        Returns:
+            ``True`` if the SL moved (caller updates the exchange SL order).
+        """
+        atr      = pos.initial_atr
+        entry    = pos.entry
+        activate = config.TRAIL_ACTIVATE_ATR
+        is_long  = pos.side == "LONG"
+
+        favour = (price - entry) if is_long else (entry - price)
+        if activate <= 0 or favour < activate * atr:
+            return False
+
+        step   = getattr(config, "TRAIL_STEP_ATR", 1.0) or 1.0
+        steps  = int((favour / atr - activate) / step + 1e-9)
+        locked = steps * step * atr
+        new_sl = (entry + locked) if is_long else (entry - locked)
+
+        sl_changed = False
+        if is_long and new_sl > pos.sl:
+            pos.sl = new_sl
+            sl_changed = True
+        elif not is_long and new_sl < pos.sl:
+            pos.sl = new_sl
+            sl_changed = True
+
+        if sl_changed:
+            logger.info(
+                f"Trail STEP — SL → {pos.sl:.2f}  "
+                f"(+{favour:.2f} = {favour / atr:.1f}×ATR in favor, "
+                f"{steps}×ATR profit locked)"
+            )
+        return sl_changed
 
     def _apply_adaptive_trail(self, pos: Position, price: float) -> bool:
         """Single tightening trailing funnel — mirrors ``backtest._apply_adaptive_trail``.
@@ -846,7 +901,7 @@ class Trader:
         try:
             positions = await loop.run_in_executor(
                 None,
-                lambda: self._exchange.fetch_positions([config.SYMBOL_CCXT]),
+                lambda: self._exchange.fetch_positions([self.symbol_ccxt]),
             )
             exchange_qty = 0.0
             for p in positions:
@@ -867,7 +922,7 @@ class Trader:
             try:
                 my_trades = await loop.run_in_executor(
                     None,
-                    lambda: self._exchange.fetch_my_trades(config.SYMBOL_CCXT, limit=5),
+                    lambda: self._exchange.fetch_my_trades(self.symbol_ccxt, limit=5),
                 )
                 for t in reversed(my_trades):
                     fill_px = float(t.get("price") or 0)
@@ -959,7 +1014,7 @@ class Trader:
             return
 
         loop     = asyncio.get_event_loop()
-        sym      = config.SYMBOL_CCXT
+        sym      = self.symbol_ccxt
         sl_side  = "sell" if pos.side == "LONG" else "buy"
         new_sl_p = self._round_price(pos.sl)
 

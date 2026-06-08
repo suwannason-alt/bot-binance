@@ -12,7 +12,7 @@ Expect (healthy): "connected" within ~1s, then a frame line within ~3s.
 import sys
 import pathlib
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)

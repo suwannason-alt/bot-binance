@@ -91,6 +91,11 @@ class CandleBuffer:
         """Number of closed candles currently held in the buffer."""
         return len(self._buf)
 
+    @property
+    def last(self) -> Optional[Candle]:
+        """Most recently committed (closed) candle, or ``None`` if empty."""
+        return self._buf[-1] if self._buf else None
+
     def arrays(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return buffer contents as five NumPy arrays: (opens, highs, lows, closes, volumes).
 

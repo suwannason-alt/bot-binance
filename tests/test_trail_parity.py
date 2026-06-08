@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 import pathlib
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _seg in ("", "src/core", "backtesting", "scripts"):
+for _seg in ("", "src/core", "src/core/shared", "src/core/strategy_1h", "backtesting", "scripts"):
     _dir = str(_REPO_ROOT / _seg) if _seg else str(_REPO_ROOT)
     if _dir not in sys.path:
         sys.path.insert(0, _dir)
@@ -29,7 +29,7 @@ import sys
 
 import pandas as pd
 
-import config
+import config_1h as config   # trail tests tune the 1H strategy config the engine reads
 import backtest
 from trader import Trader, Position
 
@@ -54,29 +54,32 @@ def _price_path(entry: float, atr: float, side: str) -> list[float]:
 
 
 def _run_case(trader: Trader, side: str, adaptive: bool, *,
-              activate: float, lock: float, stop: float) -> None:
+              activate: float, lock: float, stop: float, step: bool = False) -> None:
     entry, atr = 100.0, 1.0
     sl = entry - 1.5 * atr if side == "LONG" else entry + 1.5 * atr
     tp = entry + 6.0 * atr if side == "LONG" else entry - 6.0 * atr
 
     # Pin the full trail config on the module both paths read, so the comparison
-    # is hermetic regardless of .env / _BASE drift.
+    # is hermetic regardless of .env / _BASE drift.  All three mode flags are pinned
+    # explicitly (STEP supersedes ADAPTIVE supersedes classic in the dispatcher).
+    config.STEP_TRAILING_ENABLED = step
     config.ADAPTIVE_TRAILING_ENABLED = adaptive
     config.TRAIL_ACTIVATE_ATR = activate
     config.TRAIL_LOCK_ATR = lock
     config.TRAIL_STOP_ATR = stop
     live, bt = _make_pair(side, entry, atr, sl, tp)
 
+    mode = "STEP" if step else ("ADAPT" if adaptive else "CLASSIC")
     for price in _price_path(entry, atr, side):
         trader._apply_trail(live, price)                       # live dispatcher
         backtest._update_trailing_stop(bt, bar_high=price, bar_low=price)
         diff = abs(live.sl - bt.sl)
         assert diff < _TOL, (
-            f"[{'ADAPT' if adaptive else 'CLASSIC'} {side}] SL diverged at "
+            f"[{mode} {side}] SL diverged at "
             f"price={price:.4f}: live={live.sl:.10f}  backtest={bt.sl:.10f}  "
             f"diff={diff:.2e}"
         )
-    print(f"  ✓ {'adaptive' if adaptive else 'classic ':8} {side:5} — "
+    print(f"  ✓ {mode.lower():8} {side:5} — "
           f"final SL live={live.sl:.4f} == backtest={bt.sl:.4f}")
 
 
@@ -98,6 +101,29 @@ def main() -> int:
     print("Live deploy profile (classic ACTIVATE=1.5 LOCK=2.0 STOP=1.2)")
     for side in ("LONG", "SHORT"):
         _run_case(trader, side, adaptive=False, activate=1.5, lock=2.0, stop=1.2)
+
+    # 3) STEP profit-locking ladder — the new production capital-protection regime.
+    #    activate=1.0 ⇒ BE at +1ATR, then +1ATR locked per additional ATR.
+    print("STEP profit-lock ladder (STEP_TRAILING_ENABLED, activate=1.0)")
+    for side in ("LONG", "SHORT"):
+        _run_case(trader, side, adaptive=False, step=True, activate=1.0, lock=0.0, stop=0.0)
+
+    # Direct ladder assertion — confirms the step math itself (not just live==backtest).
+    # activate=1.2: BE triggers at +1.2ATR; +2.2ATR locks 1×ATR; +3.5ATR locks 2×ATR.
+    config.STEP_TRAILING_ENABLED = True
+    config.TRAIL_ACTIVATE_ATR = 1.2
+    _, bt = _make_pair("LONG", 100.0, 1.0, sl=98.5, tp=106.0)
+    ladder = [(101.0, 98.5), (101.2, 100.0), (102.2, 101.0), (103.5, 102.0), (102.0, 102.0)]
+    for price, want_sl in ladder:
+        backtest._update_trailing_stop(bt, bar_high=price, bar_low=price)
+        assert abs(bt.sl - want_sl) < _TOL, (
+            f"[STEP ladder] at price={price}: SL={bt.sl:.4f} want {want_sl:.4f}")
+    print("  ✓ step ladder math — BE→+1ATR→+2ATR with ratchet (no give-back)")
+
+    # Restore the module defaults so the test leaves config clean for other runners
+    # (STEP/ADAPTIVE are both opt-in = False; live & run_portfolio enable STEP explicitly).
+    config.STEP_TRAILING_ENABLED = False
+    config.ADAPTIVE_TRAILING_ENABLED = False
 
     print("ALL PARITY CHECKS PASSED")
     return 0

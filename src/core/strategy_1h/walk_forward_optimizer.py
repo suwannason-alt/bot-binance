@@ -57,7 +57,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-import config
+import config_1h as config   # WFO tunes the 1H breakout period
 
 # Maximum number of WFO retune records kept in memory.
 # One retune per 30 days → 200 entries ≈ 16+ years before the list cycles.
